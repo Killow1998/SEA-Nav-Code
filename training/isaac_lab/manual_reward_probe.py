@@ -29,7 +29,7 @@ PROBE_TUNING = {
 }
 
 
-def _parse_args():
+def build_arg_parser():
     parser = argparse.ArgumentParser(description="Manual reward probe for simple SEA-Nav scenes")
     parser.add_argument(
         "--scenario",
@@ -59,6 +59,7 @@ def _parse_args():
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--eval-obstacle-level", type=int, default=9)
     parser.add_argument("--eval-room-profile", choices=("random", "visual_progressive"), default="random")
+    parser.add_argument("--max-init-terrain-level", type=int, default=-1)
     parser.add_argument("--settle-steps", type=int, default=10)
     parser.add_argument("--stay-steps", type=int, default=-1)
     parser.add_argument("--disable-contact-termination", action="store_true", default=False)
@@ -110,7 +111,307 @@ def _parse_args():
     parser.add_argument("--turn-yaw-rate", type=float, default=PROBE_TUNING["turn_yaw_rate"])
     parser.add_argument("--path-lookahead", type=int, default=PROBE_TUNING["path_lookahead"])
     AppLauncher.add_app_launcher_args(parser)
-    return parser.parse_args()
+    return parser
+
+
+def _parse_args(argv=None):
+    parser = build_arg_parser()
+    return parser.parse_args(argv)
+
+
+def _configure_probe_tuning(args):
+    PROBE_TUNING.update(
+        {
+            "turn_entry_x_cell": args.turn_entry_x_cell,
+            "pivot_yaw_target": args.pivot_yaw_target,
+            "pre_turn_vx": args.pre_turn_vx,
+            "turn_forward_vx": args.turn_forward_vx,
+            "turn_yaw_rate": args.turn_yaw_rate,
+            "path_lookahead": args.path_lookahead,
+        }
+    )
+
+
+def _preload_probe_runtime_dependencies():
+    # GUI Isaac Sim adds its pip_prebundle to import paths during startup. Preload
+    # the NumPy/SciPy stack first so trimesh does not mix venv NumPy with Kit NumPy.
+    import numpy.random  # noqa: F401
+    import scipy.spatial  # noqa: F401
+    import trimesh  # noqa: F401
+
+
+def _run_with_sim_app(args):
+    import numpy as np
+    import torch
+
+    from sea_nav_env import SeaNavIsaacLabEnv, make_sea_nav_env_cfg
+
+    spec = _scenario_spec(args.scenario, np)
+    if args.preset_room_npy:
+        spec["room"] = np.load(args.preset_room_npy).astype(float)
+    elif args.scenario == "hard_room_eval" and args.eval_room_profile == "visual_progressive":
+        spec["room"] = _make_visual_progressive_room(np, args.eval_obstacle_level)
+    fixed_start_cell = _parse_cell_arg(args.fixed_start_cell)
+    fixed_goal_cell = _parse_cell_arg(args.fixed_goal_cell)
+    fixed_start_yaw = args.fixed_start_yaw
+    if args.case_trace:
+        if fixed_start_cell is not None or fixed_goal_cell is not None:
+            raise ValueError("--case-trace cannot be combined with --fixed-start-cell/--fixed-goal-cell")
+        case = _load_case_from_trace(args.case_trace, args.case_episode)
+        fixed_start_cell = case["start_cell"]
+        fixed_goal_cell = case["goal_cell"]
+        fixed_start_yaw = float(case["start_yaw"])
+        if not args.preset_room_npy:
+            room_file = Path(case["room_npy"])
+            if room_file.is_file():
+                spec["room"] = np.load(room_file).astype(float)
+            else:
+                raise FileNotFoundError(
+                    f"case trace did not have a sibling room.npy: {room_file}. "
+                    "Pass --preset-room-npy explicitly to override."
+                )
+    if args.scenario == "hard_room_eval" and args.controller_mode != "policy":
+        if fixed_start_cell is None or fixed_goal_cell is None:
+            raise ValueError("scripted hard_room_eval requires --fixed-start-cell and --fixed-goal-cell")
+    if args.controller_mode == "scripted":
+        command_fn = spec["command"]
+    elif args.controller_mode == "policy":
+        command_fn = None
+    elif args.controller_mode == "goal_heading":
+        command_fn = _goal_heading_command
+    elif args.controller_mode == "safe_heading":
+        command_fn = _safe_heading_command
+    elif args.controller_mode == "goal_vector":
+        command_fn = _goal_vector_command
+    elif args.controller_mode == "safe_vector":
+        command_fn = _safe_vector_command
+    elif args.controller_mode == "path_follow":
+        command_fn = _path_follow_command
+    elif args.controller_mode == "pivot_turn":
+        command_fn = _pivot_turn_command
+    elif args.controller_mode == "pivot_then_safe_heading":
+        command_fn = _pivot_then_safe_heading_command
+    elif args.controller_mode == "pivot_then_safe_vector":
+        command_fn = _pivot_then_safe_vector_command
+    else:
+        command_fn = _pivot_then_heading_command
+    timestamp = datetime.now().strftime("%m_%d_%H-%M-%S")
+    log_dir = Path(args.log_root) / f"manual_reward_probe_{args.scenario}" / timestamp
+
+    env = None
+    try:
+        go2_usd_path = _make_go2_usd(args) if args.robot_asset_source == "converted_urdf" else None
+        env_cfg = make_sea_nav_env_cfg(
+            go2_usd_path=go2_usd_path,
+            num_envs=args.num_envs,
+            seed=args.seed,
+            actuator_mode=args.actuator_mode,
+            robot_asset_source=args.robot_asset_source,
+            low_level_controller=args.low_level_controller,
+            robotlab_policy_path=args.robotlab_low_level_policy,
+            episode_length_s=args.episode_length_s,
+            nav_action_scale=tuple(args.nav_action_scale),
+            terrain_rows=1,
+            terrain_cols=1,
+            obstacle_level=args.eval_obstacle_level if args.scenario == "hard_room_eval" else 0,
+            preset_room=spec["room"],
+            randomize_friction=False,
+            randomize_base_mass=True,
+            added_mass_range=(0.0, 0.0),
+        )
+        env_cfg.add_noise = False
+        env_cfg.enable_collision_replay = False
+        if args.disable_contact_termination:
+            env_cfg.enable_contact_termination = False
+            env_cfg.termination_body_patterns = ()
+        if args.stay_steps >= 0:
+            env_cfg.stay_steps = args.stay_steps
+        if args.max_init_terrain_level >= 0:
+            env_cfg.terrain.max_init_terrain_level = args.max_init_terrain_level
+        env_cfg.sim.device = args.sim_device
+        env = SeaNavIsaacLabEnv(cfg=env_cfg, render_mode=None)
+        env.reset()
+        policy_fn = None
+        if args.controller_mode == "policy":
+            if not args.checkpoint:
+                raise ValueError("--checkpoint is required when controller-mode=policy")
+            policy_fn = _load_inference_policy(env, args.checkpoint)
+
+        if args.scenario == "hard_room_eval":
+            if args.case_trace:
+                args.fixed_start_cell = f"{fixed_start_cell[0]},{fixed_start_cell[1]}"
+                args.fixed_goal_cell = f"{fixed_goal_cell[0]},{fixed_goal_cell[1]}"
+                args.fixed_start_yaw = fixed_start_yaw
+            summary, trace_rows, room_map = _run_hard_room_eval(env, args, policy_fn, command_fn)
+            _write_summary(log_dir, summary, trace_rows, room_map=room_map)
+            print(f"[PROBE] scenario={args.scenario} log_dir={log_dir}")
+            print(json.dumps(summary, indent=2, ensure_ascii=True))
+            return {"log_dir": str(log_dir), "summary": summary, "trace_rows": trace_rows}
+
+        env_ids = torch.tensor([0], dtype=torch.long, device=env.device)
+        start_xy = torch.tensor([_grid_to_local_xy(spec["start_cell"])], device=env.device)
+        goal_xy = torch.tensor([_grid_to_local_xy(spec["goal_cell"])], device=env.device)
+        if args.controller_mode == "path_follow":
+            path_cells = _astar_path(spec["room"], spec["start_cell"], spec["goal_cell"])
+            path_points_local = torch.tensor(
+                [[_grid_to_local_xy(cell)[0], _grid_to_local_xy(cell)[1]] for cell in path_cells],
+                dtype=torch.float,
+                device=env.device,
+            )
+            env._probe_path_points_local = path_points_local
+            env._probe_path_lookahead = args.path_lookahead
+        env.set_manual_start_and_goal(env_ids, start_xy, goal_xy, yaw=0.0, root_height=0.42)
+        env.scene.write_data_to_sim()
+        env.sim.forward()
+        env.scene.update(dt=0.0)
+        env._get_observations()
+
+        zero_action = torch.zeros((1, env.num_nav_actions), device=env.device)
+        settle_invalid = False
+        for _ in range(args.settle_steps):
+            _, _, terminated, truncated, _ = env.step(zero_action)
+            if bool((terminated | truncated).item()):
+                settle_invalid = True
+                break
+
+        trace_rows = []
+        total_reward = 0.0
+        reach_reward_sum = 0.0
+        min_distance = float("inf")
+        first_reach_step = None
+        done_step = None
+        done_reason = None
+        episode_summary = None
+
+        if not settle_invalid:
+            policy_obs = env._get_observations()["policy"] if policy_fn is not None else None
+            for step_idx in range(args.max_steps):
+                if policy_fn is not None:
+                    with torch.inference_mode():
+                        command = policy_fn(policy_obs)
+                    command = _apply_policy_turn_prior(command, args)
+                else:
+                    command = torch.tensor([command_fn(step_idx, env)], dtype=torch.float, device=env.device)
+                obs_dict, rewards, terminated, truncated, extras = env.step(command)
+                if policy_fn is not None:
+                    policy_obs = obs_dict["policy"]
+
+                reward_value = rewards[0].item()
+                reach_reward_value = env.last_reward_terms["reach_pos_target_tight"][0].item()
+                distance_value = env.last_distance[0].item()
+                yaw_value = _yaw_from_quat(env.last_root_quat_w[0].tolist())
+                front_clearance = env.last_rays[0].min().item()
+                local_x = (env.last_root_pos_w[0, 0] - env._terrain.env_origins[0, 0]).item()
+                local_y = (env.last_root_pos_w[0, 1] - env._terrain.env_origins[0, 1]).item()
+                total_reward += reward_value
+                reach_reward_sum += reach_reward_value
+                min_distance = min(min_distance, distance_value)
+                if first_reach_step is None and reach_reward_value > 0.0:
+                    first_reach_step = step_idx
+
+                trace_rows.append(
+                    {
+                        "step": step_idx,
+                        "command": [float(x) for x in command[0].tolist()],
+                        "nav_action_scaled": [float(x) for x in env.nav_actions_orig[0].tolist()],
+                        "low_level_command": [float(x) for x in env.slr_commands[0].tolist()],
+                        "root_lin_vel_b": [float(x) for x in env._robot.data.root_lin_vel_b[0].tolist()],
+                        "root_ang_vel_b": [float(x) for x in env._robot.data.root_ang_vel_b[0].tolist()],
+                        "stay_timer": int(env.stay_timer[0].item()),
+                        "goal_hold_timer": int(env.goal_hold_timer[0].item()),
+                        "reward": reward_value,
+                        "reach_reward": reach_reward_value,
+                        "distance": distance_value,
+                        "yaw": yaw_value,
+                        "x": local_x,
+                        "y": local_y,
+                        "goal_local_x": env.last_goal_local_pos[0, 0].item(),
+                        "goal_local_y": env.last_goal_local_pos[0, 1].item(),
+                        "front_clearance": front_clearance,
+                        "done_contact": bool(env.last_done_contact[0].item()),
+                        "done_goal_hold": bool(env.last_done_goal_hold[0].item()),
+                        "done_stand": bool(env.last_done_stand[0].item()),
+                        "done_fall": bool(env.last_done_fall[0].item()),
+                        "done_timeout": bool(env.last_done_timeout[0].item()),
+                        "terminated": bool(terminated[0].item()),
+                        "truncated": bool(truncated[0].item()),
+                    }
+                )
+
+                if "episode" in extras and extras["episode"]:
+                    episode_summary = {key: _tensor_scalar(value) for key, value in extras["episode"].items()}
+
+                if bool((terminated | truncated).item()):
+                    done_step = step_idx
+                    done_reason = "terminated" if bool(terminated[0].item()) else "truncated"
+                    break
+        else:
+            done_reason = "invalid_settle"
+
+        summary = {
+            "scenario": args.scenario,
+            "controller_mode": args.controller_mode,
+            "actuator_mode": args.actuator_mode,
+            "robot_asset_source": args.robot_asset_source,
+            "low_level_controller": args.low_level_controller,
+            "robotlab_low_level_policy": args.robotlab_low_level_policy,
+            "checkpoint": args.checkpoint if args.checkpoint else None,
+            "stay_steps": args.stay_steps,
+            "disable_contact_termination": args.disable_contact_termination,
+            "room_cells": ROOM_CELLS,
+            "room_resolution": ROOM_RESOLUTION,
+            "start_cell": list(spec["start_cell"]),
+            "goal_cell": list(spec["goal_cell"]),
+            "settle_steps": args.settle_steps,
+            "episode_length_s": args.episode_length_s,
+            "nav_action_scale": list(args.nav_action_scale),
+            "turn_entry_x_cell": args.turn_entry_x_cell,
+            "pivot_yaw_target": args.pivot_yaw_target,
+            "pre_turn_vx": args.pre_turn_vx,
+            "turn_forward_vx": args.turn_forward_vx,
+            "turn_yaw_rate": args.turn_yaw_rate,
+            "path_lookahead": args.path_lookahead,
+            "policy_stop_radius": args.policy_stop_radius if args.policy_stop_radius >= 0.0 else None,
+            "policy_stop_mode": args.policy_stop_mode if args.policy_stop_radius >= 0.0 else None,
+            "policy_turn_yaw_threshold": args.policy_turn_yaw_threshold if args.policy_turn_yaw_threshold >= 0.0 else None,
+            "policy_turn_forward_floor_pos": args.policy_turn_forward_floor_pos if args.policy_turn_forward_floor_pos >= 0.0 else None,
+            "policy_turn_forward_floor_neg": args.policy_turn_forward_floor_neg if args.policy_turn_forward_floor_neg >= 0.0 else None,
+            "policy_path_blend_weight": args.policy_path_blend_weight if args.policy_path_blend_weight >= 0.0 else None,
+            "policy_path_blend_min_distance": args.policy_path_blend_min_distance if args.policy_path_blend_weight >= 0.0 else None,
+            "settle_invalid": settle_invalid,
+            "max_steps": args.max_steps,
+            "total_reward_sum": total_reward,
+            "reach_reward_sum": reach_reward_sum,
+            "min_distance": None if min_distance == float("inf") else min_distance,
+            "first_reach_step": first_reach_step,
+            "done_step": done_step,
+            "done_reason": done_reason,
+            "done_flags": None
+            if env is None
+            else {
+                "contact": bool(env.last_done_contact[0].item()),
+                "goal_hold": bool(env.last_done_goal_hold[0].item()),
+                "stand": bool(env.last_done_stand[0].item()),
+                "fall": bool(env.last_done_fall[0].item()),
+                "timeout": bool(env.last_done_timeout[0].item()),
+            },
+            "episode_summary": episode_summary,
+        }
+        if args.preset_room_npy:
+            summary["room_path"] = args.preset_room_npy
+        elif args.case_trace:
+            summary["room_path"] = str(Path(args.case_trace).with_name("room.npy"))
+        else:
+            room_path = log_dir / "room.npy"
+            summary["room_path"] = str(room_path)
+
+        _write_summary(log_dir, summary, trace_rows, room_map=spec["room"])
+        print(f"[PROBE] scenario={args.scenario} log_dir={log_dir}")
+        print(json.dumps(summary, indent=2, ensure_ascii=True))
+        return {"log_dir": str(log_dir), "summary": summary, "trace_rows": trace_rows}
+    finally:
+        if env is not None:
+            env.close()
 
 
 def _parse_cell_arg(value: str) -> tuple[int, int] | None:
@@ -1090,290 +1391,23 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
     return summary, trace_rows, room_map
 
 
-def main():
+def run_probe(args):
     _ensure_isaaclab_imports()
-    args = _parse_args()
-    PROBE_TUNING.update(
-        {
-            "turn_entry_x_cell": args.turn_entry_x_cell,
-            "pivot_yaw_target": args.pivot_yaw_target,
-            "pre_turn_vx": args.pre_turn_vx,
-            "turn_forward_vx": args.turn_forward_vx,
-            "turn_yaw_rate": args.turn_yaw_rate,
-            "path_lookahead": args.path_lookahead,
-        }
-    )
-    # GUI Isaac Sim adds its pip_prebundle to import paths during startup. Preload
-    # the NumPy/SciPy stack first so trimesh does not mix venv NumPy with Kit NumPy.
-    import numpy.random  # noqa: F401
-    import scipy.spatial  # noqa: F401
-    import trimesh  # noqa: F401
-
+    _configure_probe_tuning(args)
+    _preload_probe_runtime_dependencies()
     simulation_app = AppLauncher(args).app
-
-    import numpy as np
-    import torch
-
-    from sea_nav_env import SeaNavIsaacLabEnv, make_sea_nav_env_cfg
-
-    spec = _scenario_spec(args.scenario, np)
-    if args.preset_room_npy:
-        spec["room"] = np.load(args.preset_room_npy).astype(float)
-    elif args.scenario == "hard_room_eval" and args.eval_room_profile == "visual_progressive":
-        spec["room"] = _make_visual_progressive_room(np, args.eval_obstacle_level)
-    fixed_start_cell = _parse_cell_arg(args.fixed_start_cell)
-    fixed_goal_cell = _parse_cell_arg(args.fixed_goal_cell)
-    fixed_start_yaw = args.fixed_start_yaw
-    if args.case_trace:
-        if fixed_start_cell is not None or fixed_goal_cell is not None:
-            raise ValueError("--case-trace cannot be combined with --fixed-start-cell/--fixed-goal-cell")
-        case = _load_case_from_trace(args.case_trace, args.case_episode)
-        fixed_start_cell = case["start_cell"]
-        fixed_goal_cell = case["goal_cell"]
-        fixed_start_yaw = float(case["start_yaw"])
-        if not args.preset_room_npy:
-            room_file = Path(case["room_npy"])
-            if room_file.is_file():
-                spec["room"] = np.load(room_file).astype(float)
-            else:
-                raise FileNotFoundError(
-                    f"case trace did not have a sibling room.npy: {room_file}. "
-                    "Pass --preset-room-npy explicitly to override."
-                )
-    if args.scenario == "hard_room_eval" and args.controller_mode != "policy":
-        if fixed_start_cell is None or fixed_goal_cell is None:
-            raise ValueError("scripted hard_room_eval requires --fixed-start-cell and --fixed-goal-cell")
-    if args.controller_mode == "scripted":
-        command_fn = spec["command"]
-    elif args.controller_mode == "policy":
-        command_fn = None
-    elif args.controller_mode == "goal_heading":
-        command_fn = _goal_heading_command
-    elif args.controller_mode == "safe_heading":
-        command_fn = _safe_heading_command
-    elif args.controller_mode == "goal_vector":
-        command_fn = _goal_vector_command
-    elif args.controller_mode == "safe_vector":
-        command_fn = _safe_vector_command
-    elif args.controller_mode == "path_follow":
-        command_fn = _path_follow_command
-    elif args.controller_mode == "pivot_turn":
-        command_fn = _pivot_turn_command
-    elif args.controller_mode == "pivot_then_safe_heading":
-        command_fn = _pivot_then_safe_heading_command
-    elif args.controller_mode == "pivot_then_safe_vector":
-        command_fn = _pivot_then_safe_vector_command
-    else:
-        command_fn = _pivot_then_heading_command
-    timestamp = datetime.now().strftime("%m_%d_%H-%M-%S")
-    log_dir = Path(args.log_root) / f"manual_reward_probe_{args.scenario}" / timestamp
-
-    env = None
     try:
-        go2_usd_path = _make_go2_usd(args) if args.robot_asset_source == "converted_urdf" else None
-        env_cfg = make_sea_nav_env_cfg(
-            go2_usd_path=go2_usd_path,
-            num_envs=args.num_envs,
-            seed=args.seed,
-            actuator_mode=args.actuator_mode,
-            robot_asset_source=args.robot_asset_source,
-            low_level_controller=args.low_level_controller,
-            robotlab_policy_path=args.robotlab_low_level_policy,
-            episode_length_s=args.episode_length_s,
-            nav_action_scale=tuple(args.nav_action_scale),
-            terrain_rows=1,
-            terrain_cols=1,
-            obstacle_level=args.eval_obstacle_level if args.scenario == "hard_room_eval" else 0,
-            preset_room=spec["room"],
-            randomize_friction=False,
-            randomize_base_mass=True,
-            added_mass_range=(0.0, 0.0),
-        )
-        env_cfg.add_noise = False
-        env_cfg.enable_collision_replay = False
-        if args.disable_contact_termination:
-            env_cfg.enable_contact_termination = False
-            env_cfg.termination_body_patterns = ()
-        if args.stay_steps >= 0:
-            env_cfg.stay_steps = args.stay_steps
-        env_cfg.sim.device = args.sim_device
-        env = SeaNavIsaacLabEnv(cfg=env_cfg, render_mode=None)
-        env.reset()
-        policy_fn = None
-        if args.controller_mode == "policy":
-            if not args.checkpoint:
-                raise ValueError("--checkpoint is required when controller-mode=policy")
-            policy_fn = _load_inference_policy(env, args.checkpoint)
-
-        if args.scenario == "hard_room_eval":
-            if args.case_trace:
-                args.fixed_start_cell = f"{fixed_start_cell[0]},{fixed_start_cell[1]}"
-                args.fixed_goal_cell = f"{fixed_goal_cell[0]},{fixed_goal_cell[1]}"
-                args.fixed_start_yaw = fixed_start_yaw
-            summary, trace_rows, room_map = _run_hard_room_eval(env, args, policy_fn, command_fn)
-            _write_summary(log_dir, summary, trace_rows, room_map=room_map)
-            print(f"[PROBE] scenario={args.scenario} log_dir={log_dir}")
-            print(json.dumps(summary, indent=2, ensure_ascii=True))
-            return
-
-        env_ids = torch.tensor([0], dtype=torch.long, device=env.device)
-        start_xy = torch.tensor([_grid_to_local_xy(spec["start_cell"])], device=env.device)
-        goal_xy = torch.tensor([_grid_to_local_xy(spec["goal_cell"])], device=env.device)
-        if args.controller_mode == "path_follow":
-            path_cells = _astar_path(spec["room"], spec["start_cell"], spec["goal_cell"])
-            path_points_local = torch.tensor(
-                [[_grid_to_local_xy(cell)[0], _grid_to_local_xy(cell)[1]] for cell in path_cells],
-                dtype=torch.float,
-                device=env.device,
-            )
-            env._probe_path_points_local = path_points_local
-            env._probe_path_lookahead = args.path_lookahead
-        env.set_manual_start_and_goal(env_ids, start_xy, goal_xy, yaw=0.0, root_height=0.42)
-        env.scene.write_data_to_sim()
-        env.sim.forward()
-        env.scene.update(dt=0.0)
-        env._get_observations()
-
-        zero_action = torch.zeros((1, env.num_nav_actions), device=env.device)
-        settle_invalid = False
-        for _ in range(args.settle_steps):
-            _, _, terminated, truncated, _ = env.step(zero_action)
-            if bool((terminated | truncated).item()):
-                settle_invalid = True
-                break
-
-        trace_rows = []
-        total_reward = 0.0
-        reach_reward_sum = 0.0
-        min_distance = float("inf")
-        first_reach_step = None
-        done_step = None
-        done_reason = None
-        episode_summary = None
-
-        if not settle_invalid:
-            policy_obs = env._get_observations()["policy"] if policy_fn is not None else None
-            for step_idx in range(args.max_steps):
-                if policy_fn is not None:
-                    with torch.inference_mode():
-                        command = policy_fn(policy_obs)
-                    command = _apply_policy_turn_prior(command, args)
-                else:
-                    command = torch.tensor([command_fn(step_idx, env)], dtype=torch.float, device=env.device)
-                obs_dict, rewards, terminated, truncated, extras = env.step(command)
-                if policy_fn is not None:
-                    policy_obs = obs_dict["policy"]
-
-                reward_value = rewards[0].item()
-                reach_reward_value = env.last_reward_terms["reach_pos_target_tight"][0].item()
-                distance_value = env.last_distance[0].item()
-                yaw_value = _yaw_from_quat(env.last_root_quat_w[0].tolist())
-                front_clearance = env.last_rays[0].min().item()
-                local_x = (env.last_root_pos_w[0, 0] - env._terrain.env_origins[0, 0]).item()
-                local_y = (env.last_root_pos_w[0, 1] - env._terrain.env_origins[0, 1]).item()
-                total_reward += reward_value
-                reach_reward_sum += reach_reward_value
-                min_distance = min(min_distance, distance_value)
-                if first_reach_step is None and reach_reward_value > 0.0:
-                    first_reach_step = step_idx
-
-                trace_rows.append(
-                    {
-                        "step": step_idx,
-                        "command": [float(x) for x in command[0].tolist()],
-                        "nav_action_scaled": [float(x) for x in env.nav_actions_orig[0].tolist()],
-                        "low_level_command": [float(x) for x in env.slr_commands[0].tolist()],
-                        "root_lin_vel_b": [float(x) for x in env._robot.data.root_lin_vel_b[0].tolist()],
-                        "root_ang_vel_b": [float(x) for x in env._robot.data.root_ang_vel_b[0].tolist()],
-                        "stay_timer": int(env.stay_timer[0].item()),
-                        "goal_hold_timer": int(env.goal_hold_timer[0].item()),
-                        "reward": reward_value,
-                        "reach_reward": reach_reward_value,
-                        "distance": distance_value,
-                        "yaw": yaw_value,
-                        "x": local_x,
-                        "y": local_y,
-                        "goal_local_x": env.last_goal_local_pos[0, 0].item(),
-                        "goal_local_y": env.last_goal_local_pos[0, 1].item(),
-                        "front_clearance": front_clearance,
-                        "done_contact": bool(env.last_done_contact[0].item()),
-                        "done_goal_hold": bool(env.last_done_goal_hold[0].item()),
-                        "done_stand": bool(env.last_done_stand[0].item()),
-                        "done_fall": bool(env.last_done_fall[0].item()),
-                        "done_timeout": bool(env.last_done_timeout[0].item()),
-                        "terminated": bool(terminated[0].item()),
-                        "truncated": bool(truncated[0].item()),
-                    }
-                )
-
-                if "episode" in extras and extras["episode"]:
-                    episode_summary = {key: _tensor_scalar(value) for key, value in extras["episode"].items()}
-
-                if bool((terminated | truncated).item()):
-                    done_step = step_idx
-                    done_reason = "terminated" if bool(terminated[0].item()) else "truncated"
-                    break
-        else:
-            done_reason = "invalid_settle"
-
-        summary = {
-            "scenario": args.scenario,
-            "controller_mode": args.controller_mode,
-        "actuator_mode": args.actuator_mode,
-        "robot_asset_source": args.robot_asset_source,
-        "low_level_controller": args.low_level_controller,
-        "robotlab_low_level_policy": args.robotlab_low_level_policy,
-            "checkpoint": args.checkpoint if args.checkpoint else None,
-            "stay_steps": args.stay_steps,
-            "disable_contact_termination": args.disable_contact_termination,
-            "room_cells": ROOM_CELLS,
-            "room_resolution": ROOM_RESOLUTION,
-            "start_cell": list(spec["start_cell"]),
-            "goal_cell": list(spec["goal_cell"]),
-            "settle_steps": args.settle_steps,
-            "episode_length_s": args.episode_length_s,
-            "nav_action_scale": list(args.nav_action_scale),
-            "turn_entry_x_cell": args.turn_entry_x_cell,
-            "pivot_yaw_target": args.pivot_yaw_target,
-            "pre_turn_vx": args.pre_turn_vx,
-            "turn_forward_vx": args.turn_forward_vx,
-            "turn_yaw_rate": args.turn_yaw_rate,
-            "path_lookahead": args.path_lookahead,
-            "policy_stop_radius": args.policy_stop_radius if args.policy_stop_radius >= 0.0 else None,
-            "policy_stop_mode": args.policy_stop_mode if args.policy_stop_radius >= 0.0 else None,
-            "policy_turn_yaw_threshold": args.policy_turn_yaw_threshold if args.policy_turn_yaw_threshold >= 0.0 else None,
-            "policy_turn_forward_floor_pos": args.policy_turn_forward_floor_pos if args.policy_turn_forward_floor_pos >= 0.0 else None,
-            "policy_turn_forward_floor_neg": args.policy_turn_forward_floor_neg if args.policy_turn_forward_floor_neg >= 0.0 else None,
-            "policy_path_blend_weight": args.policy_path_blend_weight if args.policy_path_blend_weight >= 0.0 else None,
-            "policy_path_blend_min_distance": args.policy_path_blend_min_distance if args.policy_path_blend_weight >= 0.0 else None,
-            "settle_invalid": settle_invalid,
-            "max_steps": args.max_steps,
-            "total_reward_sum": total_reward,
-            "reach_reward_sum": reach_reward_sum,
-            "min_distance": None if min_distance == float("inf") else min_distance,
-            "first_reach_step": first_reach_step,
-            "done_step": done_step,
-            "done_reason": done_reason,
-            "done_flags": None if done_step is None or not trace_rows else {
-                "contact": trace_rows[-1]["done_contact"],
-                "goal_hold": trace_rows[-1]["done_goal_hold"],
-                "stand": trace_rows[-1]["done_stand"],
-                "fall": trace_rows[-1]["done_fall"],
-                "timeout": trace_rows[-1]["done_timeout"],
-            },
-            "episode_summary": episode_summary,
-        }
-        _write_summary(log_dir, summary, trace_rows, room_map=spec["room"])
-
-        print(f"[PROBE] scenario={args.scenario} log_dir={log_dir}")
-        print(json.dumps(summary, indent=2, ensure_ascii=True))
+        return _run_with_sim_app(args)
     except Exception:
         traceback.print_exc()
         raise
     finally:
-        if env is not None:
-            env.close()
         simulation_app.close()
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    return run_probe(args)
 
 
 if __name__ == "__main__":

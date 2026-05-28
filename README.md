@@ -59,6 +59,11 @@ for the Isaac Lab migration.
 
 Current Isaac Lab evaluation path:
 
+- Playback and visualization:
+```bash
+python training/isaac_lab/play.py --checkpoint <path-to-checkpoint>
+```
+
 - Final navigation evaluation:
 ```bash
 python training/isaac_lab/manual_reward_probe.py \
@@ -72,7 +77,9 @@ python training/isaac_lab/low_level_tracking_probe.py
 ```
 
 For the current Isaac Lab + RobotLab reproduction line, treat the scripts under
-`training/isaac_lab/` as the active validation entrypoints.
+`training/isaac_lab/` as the active validation entrypoints. In particular,
+`training/isaac_lab/play.py` is the Isaac Lab counterpart of the original Gym
+`play.py`.
 
 ---
 
