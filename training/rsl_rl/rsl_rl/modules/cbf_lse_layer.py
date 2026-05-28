@@ -6,23 +6,39 @@ import numpy as np
 class ExactLSECBFLayer(nn.Module):
     def __init__(self,
                  num_rays=41,
-                 fov_deg=180.0,
+                 fov_deg=240.0,
                  safe_radius=0.15,
                  safety_margin=0.05,
                  kappa=10.0,
                  damping_factor=1.0):
         super().__init__()
-        
+
+        self.num_rays = num_rays
+        self.fov_deg = fov_deg
         self.d_safe = safe_radius + safety_margin
         self.kappa = kappa
         self.damping_factor = damping_factor
-        
-        # Pre-calculate unit direction vectors n_i
-        start_angle = -np.deg2rad(fov_deg) / 2
-        end_angle = np.deg2rad(fov_deg) / 2
-        angles = torch.linspace(start_angle, end_angle, num_rays)
-        self.register_buffer('ray_unit_vectors',
-            torch.stack([torch.cos(angles), torch.sin(angles)], dim=1))
+
+        # Keep the geometry buffer checkpoint-compatible, but always recompute it
+        # from the configured ray count / FOV instead of trusting older saved values.
+        self.register_buffer("ray_unit_vectors", torch.zeros(num_rays, 2), persistent=True)
+        self._refresh_ray_geometry()
+
+    def _refresh_ray_geometry(self):
+        start_angle = -np.deg2rad(self.fov_deg) / 2
+        end_angle = np.deg2rad(self.fov_deg) / 2
+        angles = torch.linspace(start_angle, end_angle, self.num_rays, device=self.ray_unit_vectors.device)
+        self.ray_unit_vectors.copy_(torch.stack([torch.cos(angles), torch.sin(angles)], dim=1))
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        # Older checkpoints persist this buffer with the legacy 180-degree geometry.
+        # Ignore the stored value and rebuild from the configured FOV after load.
+        ray_key = prefix + "ray_unit_vectors"
+        state_dict.pop(ray_key, None)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+        if ray_key in missing_keys:
+            missing_keys.remove(ray_key)
+        self._refresh_ray_geometry()
 
     def forward(self, u_bar, lidar_dists, alpha):
         """

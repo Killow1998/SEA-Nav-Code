@@ -34,7 +34,7 @@ from collections import deque
 import statistics
 from datetime import datetime
 
-# from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 import torch
 
 from rsl_rl.env import VecEnv
@@ -83,9 +83,15 @@ class OnPolicyRunner:
         
         self.log_dir = log_dir
         self.writer = None
+        if self.log_dir is not None:
+            os.makedirs(self.log_dir, exist_ok=True)
+            self.writer = SummaryWriter(log_dir=os.path.join(self.log_dir, "tensorboard"))
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
+        self.best_mean_reward = float("-inf")
+        self.best_reach_metric = float("-inf")
+        self.best_goal_hold_metric = float("-inf")
 
         _, _ = self.env.reset()
     
@@ -139,7 +145,14 @@ class OnPolicyRunner:
                 start = stop
                 self.alg.compute_returns(critic_obs, infos)
             
-            mean_value_loss, mean_surrogate_loss, mean_regularization_loss, mean_smooth_loss, mean_interv_loss = self.alg.update()
+            (
+                mean_value_loss,
+                mean_surrogate_loss,
+                mean_regularization_loss,
+                mean_smooth_loss,
+                mean_interv_loss,
+                mean_policy_anchor_loss,
+            ) = self.alg.update()
             
             stop = time.time()
             learn_time = stop - start
@@ -151,18 +164,78 @@ class OnPolicyRunner:
                             config = config,
                     )
             if self.log_dir is not None and it % 10 == 0 and it > self.current_learning_iteration + 10:
+                if self.writer is not None:
+                    self.tensorboard_log(locals())
                 if self.args.wandb:
                     self.wandb_log(locals())
                 else:
                     self.print_log(locals(), extra=True)
+            if self.log_dir is not None and len(rewbuffer) > 0:
+                mean_reward = statistics.mean(rewbuffer)
+                if mean_reward > self.best_mean_reward:
+                    self.best_mean_reward = mean_reward
+                    self.save(os.path.join(self.log_dir, "best_mean_reward.pt"), iter_override=it)
+            if self.log_dir is not None:
+                reach_metric = self._extract_episode_metric(ep_infos, "rew_reach_pos_target_tight")
+                if reach_metric is not None and reach_metric > self.best_reach_metric:
+                    self.best_reach_metric = reach_metric
+                    self.save(os.path.join(self.log_dir, "best_reach.pt"), iter_override=it)
+                goal_hold_metric = self._extract_episode_metric(ep_infos, "goal_hold_success")
+                if goal_hold_metric is not None and goal_hold_metric > self.best_goal_hold_metric:
+                    self.best_goal_hold_metric = goal_hold_metric
+                    self.save(os.path.join(self.log_dir, "best_goal_hold.pt"), iter_override=it)
             if it == self.current_learning_iteration + 100:
                 os.makedirs(self.log_dir, exist_ok=True)
             if it % self.save_interval == 0 and it > self.current_learning_iteration + 100:
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)), iter_override=it)
             ep_infos.clear()
         
         self.current_learning_iteration += num_learning_iterations
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+        if self.writer is not None:
+            self.writer.flush()
+            self.writer.close()
+
+    def _extract_episode_metric(self, ep_infos, key):
+        if not ep_infos:
+            return None
+        infotensor = torch.tensor([], device=self.device)
+        for ep_info in ep_infos:
+            if key not in ep_info:
+                continue
+            value = ep_info[key]
+            if not isinstance(value, torch.Tensor):
+                value = torch.Tensor([value])
+            if len(value.shape) == 0:
+                value = value.unsqueeze(0)
+            infotensor = torch.cat((infotensor, value.to(self.device)))
+        if infotensor.numel() == 0:
+            return None
+        return torch.mean(infotensor).item()
+
+    def tensorboard_log(self, locs):
+        self.writer.add_scalar('Loss/value_function', locs['mean_value_loss'], locs['it'])
+        self.writer.add_scalar('Loss/surrogate', locs['mean_surrogate_loss'], locs['it'])
+        self.writer.add_scalar('Loss/regularization', locs['mean_regularization_loss'], locs['it'])
+        self.writer.add_scalar('Loss/smooth', locs['mean_smooth_loss'], locs['it'])
+        self.writer.add_scalar('Loss/intervention', locs['mean_interv_loss'], locs['it'])
+        self.writer.add_scalar('Loss/policy_anchor', locs['mean_policy_anchor_loss'], locs['it'])
+        self.writer.add_scalar('Train/learning_rate', self.alg.learning_rate, locs['it'])
+        self.writer.add_scalar('Perf/collection_time_s', locs['collection_time'], locs['it'])
+        self.writer.add_scalar('Perf/learn_time_s', locs['learn_time'], locs['it'])
+        if len(locs['rewbuffer']) > 0:
+            self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
+            self.writer.add_scalar('Train/mean_episode_length', statistics.mean(locs['lenbuffer']), locs['it'])
+        if locs['ep_infos']:
+            for key in locs['ep_infos'][0]:
+                infotensor = torch.tensor([], device=self.device)
+                for ep_info in locs['ep_infos']:
+                    if not isinstance(ep_info[key], torch.Tensor):
+                        ep_info[key] = torch.Tensor([ep_info[key]])
+                    if len(ep_info[key].shape) == 0:
+                        ep_info[key] = ep_info[key].unsqueeze(0)
+                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
+                self.writer.add_scalar(f'Episode/{key}', torch.mean(infotensor).item(), locs['it'])
 
     
     def wandb_log(self, locs, width=80, pad=35):
@@ -195,6 +268,8 @@ class OnPolicyRunner:
             'Loss/Regularization': locs['mean_regularization_loss'],
             'Loss/Smooth': locs['mean_smooth_loss'],
             'Loss/Interv': locs['mean_interv_loss'],
+            'Loss/PolicyAnchor': locs['mean_policy_anchor_loss'],
+            'Train/LearningRate': self.alg.learning_rate,
         })
 
         if len(locs['rewbuffer']) > 0:
@@ -238,6 +313,8 @@ class OnPolicyRunner:
                       f"""{'Regularization loss:':>{pad}} {locs['mean_regularization_loss']:.4f}\n"""""
                       f"""{'Smooth loss:':>{pad}} {locs['mean_smooth_loss']:.4f}\n"""""
                       f"""{'Interv loss:':>{pad}} {locs['mean_interv_loss']:.4f}\n"""""
+                      f"""{'Policy anchor loss:':>{pad}} {locs['mean_policy_anchor_loss']:.4f}\n"""""
+                      f"""{'Learning rate:':>{pad}} {self.alg.learning_rate:.6f}\n"""""
                       f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                       f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
                       )
@@ -245,11 +322,11 @@ class OnPolicyRunner:
 
         print(log_string)
 
-    def save(self, path, infos=None):
+    def save(self, path, infos=None, iter_override=None):
         torch.save({
             'model_state_dict': self.alg.actor_critic.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
-            'iter': self.current_learning_iteration,
+            'iter': self.current_learning_iteration if iter_override is None else iter_override,
             'infos': infos,
             }, path)
 

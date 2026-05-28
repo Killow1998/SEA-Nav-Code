@@ -48,10 +48,31 @@ python training/legged_gym/legged_gym/scripts/train.py --headless
 ```
 
 ### Testing
-To visualize and test a trained policy:
+Legacy Isaac Gym visualization and playback:
 ```bash
 python training/legged_gym/legged_gym/scripts/play.py
 ```
+
+This path is the original open-source Isaac Gym evaluation route. It is useful
+as a semantic reference, but it is not the currently validated evaluation path
+for the Isaac Lab migration.
+
+Current Isaac Lab evaluation path:
+
+- Final navigation evaluation:
+```bash
+python training/isaac_lab/manual_reward_probe.py \
+  --scenario hard_room_eval \
+  --controller-mode policy \
+  --checkpoint <path-to-checkpoint>
+```
+- Low-level command-tracking evaluation:
+```bash
+python training/isaac_lab/low_level_tracking_probe.py
+```
+
+For the current Isaac Lab + RobotLab reproduction line, treat the scripts under
+`training/isaac_lab/` as the active validation entrypoints.
 
 ---
 

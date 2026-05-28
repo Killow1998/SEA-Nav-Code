@@ -31,6 +31,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import copy
 
 from rsl_rl.modules.actor_critic import ActorCritic
 from rsl_rl.storage import RolloutStorage
@@ -53,6 +54,11 @@ class PPO:
                  use_clipped_value_loss=True,
                  schedule="fixed",
                  desired_kl=0.01,
+                 policy_anchor_coef=0.0,
+                 action_reg_min=(-0.5, -0.8, -1.0),
+                 action_reg_max=(1.7, 0.8, 1.0),
+                 learning_rate_min=1e-5,
+                 learning_rate_max=1e-2,
                  device='cpu',
                  ):
 
@@ -61,10 +67,16 @@ class PPO:
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
+        self.policy_anchor_coef = policy_anchor_coef
+        self.action_reg_min = tuple(action_reg_min)
+        self.action_reg_max = tuple(action_reg_max)
+        self.learning_rate_min = learning_rate_min
+        self.learning_rate_max = learning_rate_max
 
         # PPO components
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
+        self.reference_actor_critic = None
         self.storage = None # initialized later
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
         self.transition = RolloutStorage.Transition()
@@ -92,6 +104,12 @@ class PPO:
     
     def train_mode(self):
         self.actor_critic.train()
+
+    def set_reference_actor_critic(self, reference_actor_critic):
+        self.reference_actor_critic = copy.deepcopy(reference_actor_critic).to(self.device)
+        self.reference_actor_critic.eval()
+        for param in self.reference_actor_critic.parameters():
+            param.requires_grad_(False)
         
 
     def compute_alpha_loss(self, alpha, alpha_min=0.5):
@@ -101,10 +119,9 @@ class PPO:
         loss_alpha = torch.mean(penalty ** 2)
         return loss_alpha
 
-    def compute_smoothness_loss(self, current_states, next_states):
+    def compute_smoothness_loss(self, current_states, next_states, valid_mask=None):
         batch_size = current_states.size(0)
-        _u = torch.rand(batch_size, 1, device=current_states.device)
-        mix_weights = ((_u - 0.5) * 2.0)
+        mix_weights = torch.rand(batch_size, 1, device=current_states.device)
         
         # s̄ = s + (s_next - s)*u
         delta_states = next_states - current_states
@@ -115,12 +132,19 @@ class PPO:
         orig_actions = self.actor_critic.action_mean
         self.actor_critic.act(interp_states)
         interp_actions = self.actor_critic.action_mean
-        actor_smoothness = F.mse_loss(interp_actions, orig_actions)
+        actor_errors = torch.mean(torch.square(interp_actions - orig_actions), dim=-1)
         
         # with torch.no_grad():
         orig_values = self.actor_critic.evaluate(current_states)
         interp_values = self.actor_critic.evaluate(interp_states)
-        critic_smoothness = F.mse_loss(interp_values, orig_values)
+        critic_errors = torch.mean(torch.square(interp_values - orig_values), dim=-1)
+        if valid_mask is not None:
+            valid_mask = valid_mask.to(dtype=actor_errors.dtype, device=actor_errors.device).flatten()
+            actor_smoothness = (actor_errors * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+            critic_smoothness = (critic_errors * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+        else:
+            actor_smoothness = actor_errors.mean()
+            critic_smoothness = critic_errors.mean()
         
         total_loss = (
             1 * actor_smoothness +
@@ -170,6 +194,7 @@ class PPO:
         mean_smooth_loss = 0.
         mean_regularization_loss = 0.
         mean_interv_loss = 0.0
+        mean_policy_anchor_loss = 0.0
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
@@ -177,9 +202,10 @@ class PPO:
             
         for obs_batch, next_obs_batch, actions_batch, \
                 target_values_batch, advantages_batch, returns_batch, \
-                old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, bad_masks_batch in generator:
+                old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, bad_masks_batch, dones_batch in generator:
 
                 valid_mask = (~bad_masks_batch.bool()).flatten()
+                smooth_valid_mask = valid_mask & (~dones_batch.bool()).flatten()
                 
                 self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
                 actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
@@ -197,9 +223,9 @@ class PPO:
                         kl_mean = (kl * valid_mask).sum() / (valid_mask.sum() + 1e-8)
 
                         if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                            self.learning_rate = max(self.learning_rate_min, self.learning_rate / 1.5)
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                            self.learning_rate = min(self.learning_rate_max, self.learning_rate * 1.5)
                         
                         for param_group in self.optimizer.param_groups:
                             param_group['lr'] = self.learning_rate
@@ -227,11 +253,11 @@ class PPO:
                         + 1.0 * value_loss \
                         - self.entropy_coef * (entropy_batch * valid_mask).sum() / (valid_mask.sum() + 1e-8)
                 
-                clip_mins = torch.tensor([-0.5, -0.8, -1.0], device=mu_batch.device)
-                clip_maxs = torch.tensor([1.7,  0.8,  1.0], device=mu_batch.device)
+                clip_mins = torch.tensor(self.action_reg_min, device=mu_batch.device)
+                clip_maxs = torch.tensor(self.action_reg_max, device=mu_batch.device)
                 range_loss = (torch.sum((mu_batch - torch.clip(mu_batch, min=clip_mins, max=clip_maxs))**2, dim=-1) * valid_mask).sum() / (valid_mask.sum() + 1e-8)
                 
-                smooth_loss = self.compute_smoothness_loss(obs_batch, next_obs_batch)
+                smooth_loss = self.compute_smoothness_loss(obs_batch, next_obs_batch, smooth_valid_mask)
                 regularization_loss = range_loss + 0.05 * smooth_loss
                 loss += 1.0 * regularization_loss
 
@@ -249,6 +275,16 @@ class PPO:
                 else:
                     interv_loss = torch.tensor(0.0)
 
+                if self.reference_actor_critic is not None and self.policy_anchor_coef > 0.0:
+                    with torch.no_grad():
+                        ref_actions = self.reference_actor_critic.forward(obs_batch)
+                    policy_anchor_loss = (
+                        torch.sum((mu_batch - ref_actions) ** 2, dim=-1) * valid_mask
+                    ).sum() / (valid_mask.sum() + 1e-8)
+                    loss += self.policy_anchor_coef * policy_anchor_loss
+                else:
+                    policy_anchor_loss = torch.tensor(0.0, device=self.device)
+
                 # Gradient step
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -260,6 +296,7 @@ class PPO:
                 mean_smooth_loss += smooth_loss.item()
                 mean_regularization_loss += regularization_loss.item()
                 mean_interv_loss += interv_loss.item()
+                mean_policy_anchor_loss += policy_anchor_loss.item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
@@ -267,7 +304,15 @@ class PPO:
         mean_regularization_loss /= num_updates
         mean_smooth_loss /= num_updates
         mean_interv_loss /= num_updates
+        mean_policy_anchor_loss /= num_updates
 
         self.storage.clear()
 
-        return mean_value_loss, mean_surrogate_loss,  mean_regularization_loss, mean_smooth_loss, mean_interv_loss
+        return (
+            mean_value_loss,
+            mean_surrogate_loss,
+            mean_regularization_loss,
+            mean_smooth_loss,
+            mean_interv_loss,
+            mean_policy_anchor_loss,
+        )

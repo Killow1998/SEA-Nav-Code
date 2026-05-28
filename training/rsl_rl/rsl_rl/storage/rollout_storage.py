@@ -164,6 +164,7 @@ class RolloutStorage:
         observations = self.observations.flatten(0, 1)
         next_observations = self.next_observations.flatten(0, 1)
         actions = self.actions.flatten(0, 1)
+        dones = self.dones.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
@@ -180,6 +181,7 @@ class RolloutStorage:
                 obs_batch = observations[batch_idx]
                 next_obs_batch = next_observations[batch_idx]
                 actions_batch = actions[batch_idx]
+                dones_batch = dones[batch_idx]
                 target_values_batch = values[batch_idx]
                 returns_batch = returns[batch_idx]
                 old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
@@ -190,7 +192,7 @@ class RolloutStorage:
                 
                 yield obs_batch, next_obs_batch, actions_batch, \
                     target_values_batch, advantages_batch, returns_batch, \
-                    old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None, bad_masks_batch
+                    old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None, bad_masks_batch, dones_batch
    
                        
                 
