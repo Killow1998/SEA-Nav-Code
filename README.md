@@ -64,6 +64,11 @@ Current Isaac Lab evaluation path:
 python training/isaac_lab/play.py --checkpoint <path-to-checkpoint>
 ```
 
+Gym-like playback extras are also available on the Isaac Lab side, for example:
+```bash
+python training/isaac_lab/play.py --show-play-camera --record-video
+```
+
 - Final navigation evaluation:
 ```bash
 python training/isaac_lab/manual_reward_probe.py \

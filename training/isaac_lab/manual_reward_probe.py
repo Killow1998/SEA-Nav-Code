@@ -94,6 +94,7 @@ def build_arg_parser():
     parser.add_argument("--policy-path-blend-weight", type=float, default=-1.0)
     parser.add_argument("--policy-path-blend-min-distance", type=float, default=1.0)
     parser.add_argument("--record-topdown-video", type=str, default="")
+    parser.add_argument("--record-frame-dir", type=str, default="")
     parser.add_argument("--record-video-fps", type=float, default=24.0)
     parser.add_argument("--record-video-width", type=int, default=1024)
     parser.add_argument("--record-video-height", type=int, default=1024)
@@ -102,6 +103,8 @@ def build_arg_parser():
     parser.add_argument("--record-camera-height", type=float, default=16.0)
     parser.add_argument("--show-topdown-camera", action="store_true", default=False)
     parser.add_argument("--show-start-goal-markers", action="store_true", default=False)
+    parser.add_argument("--viewer-camera-eye", type=float, nargs=3, metavar=("X", "Y", "Z"), default=())
+    parser.add_argument("--viewer-camera-target", type=float, nargs=3, metavar=("X", "Y", "Z"), default=())
     parser.add_argument("--record-start-delay-s", type=float, default=0.0)
     parser.add_argument("--step-sleep-s", type=float, default=0.0)
     parser.add_argument("--turn-entry-x-cell", type=float, default=PROBE_TUNING["turn_entry_x_cell"])
@@ -900,12 +903,27 @@ def _load_inference_policy(env, checkpoint_path: str):
     loaded_dict = torch.load(checkpoint_path, map_location=env.device)
     actor_critic.load_state_dict(loaded_dict["model_state_dict"])
     actor_critic.eval()
+    print(f"[PLAY] loaded_policy={checkpoint_path}")
     return actor_critic.act_inference
 
 
-def _setup_topdown_viewport_camera(env, start_local_xy, goal_local_xy, camera_height: float):
+def _setup_viewport_camera(env, eye, target, label: str):
     import omni.kit.app
 
+    env.sim.set_camera_view(
+        eye=tuple(float(v) for v in eye),
+        target=tuple(float(v) for v in target),
+    )
+    for _ in range(4):
+        omni.kit.app.get_app().update()
+    print(
+        f"[RECORD] {label} "
+        f"eye=({float(eye[0]):.3f},{float(eye[1]):.3f},{float(eye[2]):.3f}) "
+        f"target=({float(target[0]):.3f},{float(target[1]):.3f},{float(target[2]):.3f})"
+    )
+
+
+def _setup_topdown_viewport_camera(env, start_local_xy, goal_local_xy, camera_height: float):
     origin = env._terrain.env_origins[0]
     origin_x = float(origin[0].item())
     origin_y = float(origin[1].item())
@@ -916,16 +934,14 @@ def _setup_topdown_viewport_camera(env, start_local_xy, goal_local_xy, camera_he
 
     # A perfectly vertical free-camera can produce an unstable up-vector in Kit.
     # Keep a tiny Y offset while staying visually top-down.
-    env.sim.set_camera_view(
+    _setup_viewport_camera(
+        env,
         eye=(origin_x, origin_y - 0.01, camera_height),
         target=(origin_x, origin_y, 0.0),
+        label="topdown_camera_ready",
     )
-    for _ in range(4):
-        omni.kit.app.get_app().update()
     print(
-        "[RECORD] topdown_camera_ready "
-        f"eye=({origin_x:.3f},{origin_y - 0.01:.3f},{camera_height:.3f}) "
-        f"target=({origin_x:.3f},{origin_y:.3f},0.000) "
+        "[RECORD] topdown_camera_context "
         f"robot=({robot_x:.3f},{robot_y:.3f}) "
         f"goal=({goal_x:.3f},{goal_y:.3f}) "
         f"start_local=({float(start_local_xy[0]):.3f},{float(start_local_xy[1]):.3f}) "
@@ -980,13 +996,15 @@ class TopDownViewportRecorder:
     def __init__(
         self,
         output_path: str,
+        frame_output_dir: str,
         fps: float,
         every_n_steps: int,
         max_frames: int,
         camera_height: float,
         resolution: tuple[int, int],
     ):
-        self.output_path = Path(output_path)
+        self.output_path = Path(output_path) if output_path else None
+        self.frame_output_dir = Path(frame_output_dir) if frame_output_dir else None
         self.fps = fps
         self.every_n_steps = max(1, every_n_steps)
         self.max_frames = max_frames
@@ -1024,9 +1042,15 @@ class TopDownViewportRecorder:
         camera_xform.ClearXformOpOrder()
         camera_xform.AddTranslateOp().Set(Gf.Vec3d(origin_x, origin_y, self.camera_height))
 
-        self._render_product = rep.create.render_product(str(camera_path), resolution=self.resolution, force_new=True)
-        self._annotator = rep.AnnotatorRegistry.get_annotator("rgb")
-        self._annotator.attach([self._render_product])
+        try:
+            self._render_product = rep.create.render_product(str(camera_path), resolution=self.resolution, force_new=True)
+            self._annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+            self._annotator.attach([self._render_product])
+        except Exception as exc:
+            raise RuntimeError(
+                "Playback recording requires a working Isaac Sim renderer. "
+                "The current environment could not initialize the Replicator render pipeline."
+            ) from exc
         for _ in range(4):
             app.update()
 
@@ -1046,22 +1070,28 @@ class TopDownViewportRecorder:
             raise RuntimeError(f"Unexpected RGB annotator image shape: {image.shape}")
         import cv2
 
+        if self.frame_output_dir is not None:
+            self.frame_output_dir.mkdir(parents=True, exist_ok=True)
         if self._video_writer is None:
-            self.output_path.parent.mkdir(parents=True, exist_ok=True)
-            height, width = image.shape[:2]
-            self._video_writer = cv2.VideoWriter(
-                str(self.output_path),
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                self.fps,
-                (width, height),
-            )
-            if not self._video_writer.isOpened():
-                raise RuntimeError(f"Failed to open video writer: {self.output_path}")
+            if self.output_path is not None:
+                self.output_path.parent.mkdir(parents=True, exist_ok=True)
+                height, width = image.shape[:2]
+                self._video_writer = cv2.VideoWriter(
+                    str(self.output_path),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    self.fps,
+                    (width, height),
+                )
+                if not self._video_writer.isOpened():
+                    raise RuntimeError(f"Failed to open video writer: {self.output_path}")
         if image.shape[2] >= 4:
             frame = cv2.cvtColor(image[:, :, :4], cv2.COLOR_RGBA2BGR)
         else:
             frame = cv2.cvtColor(image[:, :, :3], cv2.COLOR_RGB2BGR)
-        self._video_writer.write(frame)
+        if self._video_writer is not None:
+            self._video_writer.write(frame)
+        if self.frame_output_dir is not None:
+            cv2.imwrite(str(self.frame_output_dir / f"frame_{self.frame_count:04d}.png"), frame)
         self.frame_count += 1
 
     def close(self):
@@ -1071,7 +1101,10 @@ class TopDownViewportRecorder:
             self._video_writer.release()
         if self.frame_count == 0:
             raise RuntimeError("No frames were captured for the top-down video")
-        print(f"[RECORD] topdown_video={self.output_path} frames={self.frame_count} fps={self.fps}")
+        if self._video_writer is not None and self.output_path is not None:
+            print(f"[RECORD] topdown_video={self.output_path} frames={self.frame_count} fps={self.fps}")
+        if self.frame_output_dir is not None:
+            print(f"[RECORD] frame_dir={self.frame_output_dir} frames={self.frame_count}")
 
 
 def _write_summary(log_dir: Path, summary: dict, trace_rows: list[dict], room_map=None):
@@ -1155,9 +1188,10 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
         raise ValueError("hard_room_eval requires either a policy function or a scripted command function")
     if policy_fn is None and fixed_start_cell is None:
         raise ValueError("scripted hard_room_eval requires --fixed-start-cell and --fixed-goal-cell")
-    if args.record_topdown_video and args.episodes != 1:
-        raise ValueError("--record-topdown-video currently requires --episodes 1")
     recorder = None
+    custom_viewer_eye = tuple(getattr(args, "viewer_camera_eye", ()) or ())
+    custom_viewer_target = tuple(getattr(args, "viewer_camera_target", ()) or ())
+    frame_output_dir = getattr(args, "record_frame_dir", "")
 
     for episode_idx in range(args.episodes):
         obs_dict, _ = env.reset()
@@ -1184,9 +1218,10 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
         start_yaw = _yaw_from_quat(env._robot.data.root_quat_w[0].tolist())
         if args.show_start_goal_markers:
             _add_start_goal_markers(env, start_local_xy, goal_local_xy)
-        if args.record_topdown_video and recorder is None:
+        if (args.record_topdown_video or frame_output_dir) and recorder is None:
             recorder = TopDownViewportRecorder(
                 output_path=args.record_topdown_video,
+                frame_output_dir=frame_output_dir,
                 fps=args.record_video_fps,
                 every_n_steps=args.record_every_n_steps,
                 max_frames=args.record_max_frames,
@@ -1194,10 +1229,15 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
                 resolution=(args.record_video_width, args.record_video_height),
             )
             recorder.setup(env, start_local_xy, goal_local_xy)
+            if len(custom_viewer_eye) == 3 and len(custom_viewer_target) == 3:
+                _setup_viewport_camera(env, custom_viewer_eye, custom_viewer_target, label="play_camera_ready")
             recorder.capture_if_due(0)
         elif args.show_topdown_camera:
-            _setup_topdown_viewport_camera(env, start_local_xy, goal_local_xy, args.record_camera_height)
-        if (args.record_topdown_video or args.show_topdown_camera) and args.record_start_delay_s > 0.0:
+            if len(custom_viewer_eye) == 3 and len(custom_viewer_target) == 3:
+                _setup_viewport_camera(env, custom_viewer_eye, custom_viewer_target, label="play_camera_ready")
+            else:
+                _setup_topdown_viewport_camera(env, start_local_xy, goal_local_xy, args.record_camera_height)
+        if (args.record_topdown_video or frame_output_dir or args.show_topdown_camera) and args.record_start_delay_s > 0.0:
             print(f"[RECORD] start_delay_s={args.record_start_delay_s}")
             time.sleep(args.record_start_delay_s)
 
@@ -1395,6 +1435,12 @@ def run_probe(args):
     _ensure_isaaclab_imports()
     _configure_probe_tuning(args)
     _preload_probe_runtime_dependencies()
+    if (
+        getattr(args, "record_topdown_video", "")
+        or getattr(args, "record_frame_dir", "")
+        or getattr(args, "show_topdown_camera", False)
+    ):
+        setattr(args, "enable_cameras", True)
     simulation_app = AppLauncher(args).app
     try:
         return _run_with_sim_app(args)

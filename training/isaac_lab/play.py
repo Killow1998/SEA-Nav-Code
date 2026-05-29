@@ -19,6 +19,8 @@ DEFAULT_MAIN_RUN_DIR = (
 DEFAULT_ROBOTLAB_POLICY = (
     REPO_ROOT / "training" / "isaac_lab" / "low_level_policies" / "robotlab_go2_flat_20260527" / "policy.pt"
 )
+DEFAULT_PLAY_CAMERA_EYE = (5.0, 5.0, 7.0)
+DEFAULT_PLAY_CAMERA_TARGET = (4.99, 5.0, 0.0)
 
 
 def _resolve_default_checkpoint() -> Path:
@@ -48,6 +50,10 @@ def _resolve_default_checkpoint() -> Path:
         "No default Isaac Lab playback checkpoint was found under "
         f"{DEFAULT_MAIN_RUN_DIR}. Pass --checkpoint explicitly."
     )
+
+
+def _resolve_export_dir(checkpoint_path: Path) -> Path:
+    return checkpoint_path.parent / "exported"
 
 
 def _build_parser():
@@ -84,14 +90,34 @@ def _build_parser():
     parser.add_argument("--policy-stop-radius", type=float, default=-1.0)
     parser.add_argument("--policy-stop-mode", choices=("zero", "linear"), default="zero")
     parser.add_argument("--nav-action-scale", type=float, nargs=3, metavar=("VX", "VY", "WZ"), default=(1.0, 1.0, 1.0))
+    parser.add_argument("--record-video", action="store_true", default=False)
+    parser.add_argument("--record-video-path", type=str, default="")
+    parser.add_argument("--save-frames", action="store_true", default=False)
+    parser.add_argument("--frames-dir", type=str, default="")
     parser.add_argument("--record-topdown-video", type=str, default="")
-    parser.add_argument("--record-video-fps", type=float, default=24.0)
-    parser.add_argument("--record-video-width", type=int, default=1024)
-    parser.add_argument("--record-video-height", type=int, default=1024)
-    parser.add_argument("--record-every-n-steps", type=int, default=4)
-    parser.add_argument("--record-max-frames", type=int, default=240)
+    parser.add_argument("--record-frame-dir", type=str, default="")
+    parser.add_argument("--record-video-fps", type=float, default=50.0)
+    parser.add_argument("--record-video-width", type=int, default=1000)
+    parser.add_argument("--record-video-height", type=int, default=1000)
+    parser.add_argument("--record-every-n-steps", type=int, default=1)
+    parser.add_argument("--record-max-frames", type=int, default=20000)
     parser.add_argument("--record-camera-height", type=float, default=16.0)
+    parser.add_argument("--show-play-camera", action="store_true", default=False)
     parser.add_argument("--show-topdown-camera", action="store_true", default=False)
+    parser.add_argument(
+        "--play-camera-eye",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=DEFAULT_PLAY_CAMERA_EYE,
+    )
+    parser.add_argument(
+        "--play-camera-target",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=DEFAULT_PLAY_CAMERA_TARGET,
+    )
     parser.add_argument("--show-start-goal-markers", action="store_true", default=False)
     parser.add_argument("--record-start-delay-s", type=float, default=0.0)
     parser.add_argument("--step-sleep-s", type=float, default=0.0)
@@ -101,6 +127,19 @@ def _build_parser():
 
 def _to_probe_args(args):
     probe_kwargs = vars(args).copy()
+    checkpoint_path = Path(probe_kwargs["checkpoint"]) if probe_kwargs["checkpoint"] else _resolve_default_checkpoint()
+    if probe_kwargs["record_video"] or probe_kwargs["record_video_path"]:
+        record_video_path = probe_kwargs["record_video_path"] or str(
+            _resolve_export_dir(checkpoint_path) / f"{checkpoint_path.stem}.mp4"
+        )
+        probe_kwargs["record_topdown_video"] = record_video_path
+    if probe_kwargs["save_frames"] or probe_kwargs["frames_dir"]:
+        frame_dir = probe_kwargs["frames_dir"] or str(_resolve_export_dir(checkpoint_path) / "frames" / checkpoint_path.stem)
+        probe_kwargs["record_frame_dir"] = frame_dir
+    if probe_kwargs["show_play_camera"]:
+        probe_kwargs["show_topdown_camera"] = True
+        probe_kwargs["viewer_camera_eye"] = tuple(probe_kwargs["play_camera_eye"])
+        probe_kwargs["viewer_camera_target"] = tuple(probe_kwargs["play_camera_target"])
     probe_kwargs.update(
         {
             "scenario": "hard_room_eval",
@@ -121,8 +160,15 @@ def _to_probe_args(args):
     if probe_kwargs["use_repo_log_root"]:
         probe_kwargs["log_root"] = str(DEFAULT_REPO_LOG_ROOT)
     probe_kwargs.pop("use_repo_log_root", None)
+    probe_kwargs.pop("record_video", None)
+    probe_kwargs.pop("record_video_path", None)
+    probe_kwargs.pop("save_frames", None)
+    probe_kwargs.pop("frames_dir", None)
+    probe_kwargs.pop("show_play_camera", None)
+    probe_kwargs.pop("play_camera_eye", None)
+    probe_kwargs.pop("play_camera_target", None)
     if not probe_kwargs["checkpoint"]:
-        probe_kwargs["checkpoint"] = str(_resolve_default_checkpoint())
+        probe_kwargs["checkpoint"] = str(checkpoint_path)
     return argparse.Namespace(**probe_kwargs)
 
 
