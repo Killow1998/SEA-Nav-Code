@@ -69,6 +69,9 @@ Gym-like playback extras are also available on the Isaac Lab side, for example:
 python training/isaac_lab/play.py --show-play-camera --record-video
 ```
 
+Recording is currently validated on the rendered Isaac Sim GUI path. Keep
+`--record-video` / `--save-frames` off when using `--headless`.
+
 - Final navigation evaluation:
 ```bash
 python training/isaac_lab/manual_reward_probe.py \

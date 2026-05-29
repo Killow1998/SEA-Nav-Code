@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import heapq
 import json
 import math
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 from datetime import datetime
@@ -1011,100 +1014,118 @@ class TopDownViewportRecorder:
         self.camera_height = camera_height
         self.resolution = resolution
         self.frame_count = 0
-        self._annotator = None
-        self._render_product = None
-        self._video_writer = None
+        self._viewport_api = None
+        self._capture_frame_dir = None
+        self._cleanup_capture_frame_dir = False
+        self._saved_resolution = None
 
-    def setup(self, env, start_local_xy, goal_local_xy):
+    def setup(self, env):
         import omni.kit.app
-        import omni.usd
-        from pxr import Gf, Sdf, UsdGeom
+        from omni.kit.viewport.utility import get_active_viewport
 
+        del env
         app = omni.kit.app.get_app()
-        ext_manager = app.get_extension_manager()
-        ext_manager.set_extension_enabled_immediate("omni.replicator.core", True)
-        for _ in range(5):
-            app.update()
-        import omni.replicator.core as rep
-
-        stage = omni.usd.get_context().get_stage()
-        origin = env._terrain.env_origins[0]
-        origin_x = float(origin[0].item())
-        origin_y = float(origin[1].item())
-
-        camera_path = Sdf.Path("/World/TopDownCamera")
-        camera = UsdGeom.Camera.Define(stage, camera_path)
-        camera.CreateProjectionAttr().Set(UsdGeom.Tokens.orthographic)
-        camera.CreateHorizontalApertureAttr().Set(12.5)
-        camera.CreateVerticalApertureAttr().Set(12.5)
-        camera.CreateClippingRangeAttr().Set(Gf.Vec2f(0.1, 1000.0))
-        camera_xform = UsdGeom.Xformable(camera.GetPrim())
-        camera_xform.ClearXformOpOrder()
-        camera_xform.AddTranslateOp().Set(Gf.Vec3d(origin_x, origin_y, self.camera_height))
+        self._viewport_api = get_active_viewport()
+        if self._viewport_api is None:
+            raise RuntimeError("Playback recording requires an active Isaac Sim viewport.")
 
         try:
-            self._render_product = rep.create.render_product(str(camera_path), resolution=self.resolution, force_new=True)
-            self._annotator = rep.AnnotatorRegistry.get_annotator("rgb")
-            self._annotator.attach([self._render_product])
+            self._saved_resolution = tuple(int(v) for v in self._viewport_api.resolution)
+            self._viewport_api.resolution = tuple(int(v) for v in self.resolution)
         except Exception as exc:
-            raise RuntimeError(
-                "Playback recording requires a working Isaac Sim renderer. "
-                "The current environment could not initialize the Replicator render pipeline."
-            ) from exc
-        for _ in range(4):
-            app.update()
-
-    def capture_if_due(self, step_idx: int):
-        if self._annotator is None or step_idx % self.every_n_steps != 0:
-            return
-        if self.max_frames > 0 and self.frame_count >= self.max_frames:
-            return
-        import omni.replicator.core as rep
-
-        rep.orchestrator.step(rt_subframes=2, pause_timeline=True, delta_time=0.0, wait_for_render=True)
-        image = self._annotator.get_data(device="cpu", do_array_copy=True)
-        if isinstance(image, dict):
-            image = image["data"]
-        image = np.asarray(image)
-        if image.ndim != 3 or image.shape[2] < 3:
-            raise RuntimeError(f"Unexpected RGB annotator image shape: {image.shape}")
-        import cv2
+            raise RuntimeError("Playback recording could not configure the active viewport resolution.") from exc
 
         if self.frame_output_dir is not None:
             self.frame_output_dir.mkdir(parents=True, exist_ok=True)
-        if self._video_writer is None:
-            if self.output_path is not None:
-                self.output_path.parent.mkdir(parents=True, exist_ok=True)
-                height, width = image.shape[:2]
-                self._video_writer = cv2.VideoWriter(
-                    str(self.output_path),
-                    cv2.VideoWriter_fourcc(*"mp4v"),
-                    self.fps,
-                    (width, height),
-                )
-                if not self._video_writer.isOpened():
-                    raise RuntimeError(f"Failed to open video writer: {self.output_path}")
-        if image.shape[2] >= 4:
-            frame = cv2.cvtColor(image[:, :, :4], cv2.COLOR_RGBA2BGR)
+            self._capture_frame_dir = self.frame_output_dir
         else:
-            frame = cv2.cvtColor(image[:, :, :3], cv2.COLOR_RGB2BGR)
-        if self._video_writer is not None:
-            self._video_writer.write(frame)
-        if self.frame_output_dir is not None:
-            cv2.imwrite(str(self.frame_output_dir / f"frame_{self.frame_count:04d}.png"), frame)
+            self._capture_frame_dir = Path(tempfile.mkdtemp(prefix="sea_nav_play_frames_", dir="/tmp"))
+            self._cleanup_capture_frame_dir = True
+
+        for _ in range(4):
+            app.update()
+
+    def _capture_viewport_frame(self, frame_path: Path):
+        import omni.kit.app
+        import omni.renderer_capture
+        from omni.kit.viewport.utility import capture_viewport_to_file
+
+        if self._viewport_api is None:
+            raise RuntimeError("Playback recording viewport was not initialized.")
+
+        capture_helper = capture_viewport_to_file(self._viewport_api, file_path=str(frame_path))
+        app = omni.kit.app.get_app()
+        renderer = omni.renderer_capture.acquire_renderer_capture_interface()
+        capture_future = asyncio.ensure_future(capture_helper.wait_for_result(0))
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            app.update()
+            renderer.wait_async_capture()
+            if capture_future.done():
+                break
+        if not capture_future.done():
+            capture_future.cancel()
+            raise RuntimeError(f"Viewport capture timed out before completion: {frame_path}")
+        result = capture_future.result()
+        if result and frame_path.is_file() and frame_path.stat().st_size > 0:
+            return
+        raise RuntimeError(f"Viewport capture did not produce a readable frame: {frame_path}")
+
+    def _encode_video(self):
+        import cv2
+
+        if self.output_path is None:
+            return
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_paths = [self._capture_frame_dir / f"frame_{index:04d}.png" for index in range(self.frame_count)]
+        first_frame = cv2.imread(str(frame_paths[0]))
+        if first_frame is None:
+            raise RuntimeError(f"Failed to read first captured frame: {frame_paths[0]}")
+        height, width = first_frame.shape[:2]
+        writer = cv2.VideoWriter(
+            str(self.output_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            self.fps,
+            (width, height),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Failed to open video writer: {self.output_path}")
+        try:
+            writer.write(first_frame)
+            for frame_path in frame_paths[1:]:
+                frame = cv2.imread(str(frame_path))
+                if frame is None:
+                    raise RuntimeError(f"Failed to read captured frame: {frame_path}")
+                writer.write(frame)
+        finally:
+            writer.release()
+        if not self.output_path.is_file() or self.output_path.stat().st_size <= 0:
+            raise RuntimeError(f"Viewport capture did not produce a readable video: {self.output_path}")
+
+    def capture_if_due(self, step_idx: int):
+        if self._viewport_api is None or step_idx % self.every_n_steps != 0:
+            return
+        if self.max_frames > 0 and self.frame_count >= self.max_frames:
+            return
+        frame_path = self._capture_frame_dir / f"frame_{self.frame_count:04d}.png"
+        self._capture_viewport_frame(frame_path)
         self.frame_count += 1
 
     def close(self):
-        if self._annotator is not None:
-            self._annotator.detach()
-        if self._video_writer is not None:
-            self._video_writer.release()
         if self.frame_count == 0:
             raise RuntimeError("No frames were captured for the top-down video")
-        if self._video_writer is not None and self.output_path is not None:
+        self._encode_video()
+        if self.output_path is not None:
             print(f"[RECORD] topdown_video={self.output_path} frames={self.frame_count} fps={self.fps}")
         if self.frame_output_dir is not None:
             print(f"[RECORD] frame_dir={self.frame_output_dir} frames={self.frame_count}")
+        if self._saved_resolution is not None and self._viewport_api is not None:
+            try:
+                self._viewport_api.resolution = self._saved_resolution
+            except Exception:
+                pass
+        if self._cleanup_capture_frame_dir and self._capture_frame_dir is not None:
+            shutil.rmtree(self._capture_frame_dir, ignore_errors=True)
 
 
 def _write_summary(log_dir: Path, summary: dict, trace_rows: list[dict], room_map=None):
@@ -1228,9 +1249,11 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
                 camera_height=args.record_camera_height,
                 resolution=(args.record_video_width, args.record_video_height),
             )
-            recorder.setup(env, start_local_xy, goal_local_xy)
             if len(custom_viewer_eye) == 3 and len(custom_viewer_target) == 3:
                 _setup_viewport_camera(env, custom_viewer_eye, custom_viewer_target, label="play_camera_ready")
+            else:
+                _setup_topdown_viewport_camera(env, start_local_xy, goal_local_xy, args.record_camera_height)
+            recorder.setup(env)
             recorder.capture_if_due(0)
         elif args.show_topdown_camera:
             if len(custom_viewer_eye) == 3 and len(custom_viewer_target) == 3:
@@ -1435,6 +1458,13 @@ def run_probe(args):
     _ensure_isaaclab_imports()
     _configure_probe_tuning(args)
     _preload_probe_runtime_dependencies()
+    if (getattr(args, "record_topdown_video", "") or getattr(args, "record_frame_dir", "")) and getattr(
+        args, "headless", False
+    ):
+        raise ValueError(
+            "Isaac Lab playback recording currently requires a rendered GUI viewport. "
+            "Re-run without --headless for --record-video/--save-frames."
+        )
     if (
         getattr(args, "record_topdown_video", "")
         or getattr(args, "record_frame_dir", "")
