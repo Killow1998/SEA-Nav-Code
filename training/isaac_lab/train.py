@@ -85,12 +85,12 @@ def _build_train_cfg(args) -> dict:
             "num_learning_epochs": 5,
             "num_mini_batches": 4,
             "learning_rate": args.learning_rate,
+            "learning_rate_min": args.learning_rate_min,
+            "learning_rate_max": args.learning_rate_max,
             "schedule": args.lr_schedule,
             "gamma": 0.99,
             "lam": 0.95,
             "desired_kl": 0.01,
-            "learning_rate_min": args.learning_rate_min,
-            "learning_rate_max": args.learning_rate_max,
             "max_grad_norm": 1.0,
             "policy_anchor_coef": args.policy_anchor_coef,
             "action_reg_min": list(action_reg_min),
@@ -302,8 +302,8 @@ def _parse_args():
     parser.add_argument("--experiment-name", type=str, default="Go2_pos_rough_isaaclab")
     parser.add_argument("--run-name", type=str, default="")
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
-    parser.add_argument("--learning-rate-min", type=float, default=1.0e-5)
-    parser.add_argument("--learning-rate-max", type=float, default=1.0e-2)
+    parser.add_argument("--learning-rate-min", type=float, default=5.0e-5)
+    parser.add_argument("--learning-rate-max", type=float, default=5.0e-4)
     parser.add_argument("--lr-schedule", choices=("adaptive", "fixed"), default="adaptive")
     parser.add_argument("--entropy-coef", type=float, default=0.003)
     parser.add_argument("--action-reg-min", type=float, nargs=3, metavar=("VX", "VY", "WZ"), default=None)
@@ -340,6 +340,7 @@ def _parse_args():
     parser.add_argument("--disable-friction-rand", action="store_true", default=False)
     parser.add_argument("--disable-base-mass-rand", action="store_true", default=False)
     parser.add_argument("--disable-obs-noise", action="store_true", default=False)
+    parser.add_argument("--disable-collision-replay", action="store_true", default=False)
     parser.add_argument("--training-loop", choices=("original", "metrics"), default="original")
     parser.add_argument("--wandb", action="store_true", default=False)
     AppLauncher.add_app_launcher_args(parser)
@@ -607,6 +608,15 @@ def main():
         env_cfg.sim.device = args.sim_device
         if args.disable_obs_noise:
             env_cfg.add_noise = False
+        if args.disable_collision_replay:
+            env_cfg.enable_collision_replay = False
+        print(
+            "[INFO] env switches "
+            f"collision_replay={env_cfg.enable_collision_replay} "
+            f"obs_noise={env_cfg.add_noise} "
+            f"friction_rand={not args.disable_friction_rand} "
+            f"base_mass_rand={not args.disable_base_mass_rand}"
+        )
         print(f"[INFO] building env on device={env_cfg.sim.device}")
         env = SeaNavIsaacLabEnv(cfg=env_cfg, render_mode=None)
 

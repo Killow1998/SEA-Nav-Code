@@ -49,6 +49,8 @@ class PPO:
                  value_loss_coef=1.0,
                  entropy_coef=0.0,
                  learning_rate=1e-3,
+                 learning_rate_min=5e-5,
+                 learning_rate_max=5e-4,
                  penalty_lr=5e-2,
                  max_grad_norm=1.0,
                  use_clipped_value_loss=True,
@@ -57,8 +59,6 @@ class PPO:
                  policy_anchor_coef=0.0,
                  action_reg_min=(-0.5, -0.8, -1.0),
                  action_reg_max=(1.7, 0.8, 1.0),
-                 learning_rate_min=1e-5,
-                 learning_rate_max=1e-2,
                  device='cpu',
                  ):
 
@@ -67,11 +67,11 @@ class PPO:
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
+        self.learning_rate_min = learning_rate_min
+        self.learning_rate_max = learning_rate_max
         self.policy_anchor_coef = policy_anchor_coef
         self.action_reg_min = tuple(action_reg_min)
         self.action_reg_max = tuple(action_reg_max)
-        self.learning_rate_min = learning_rate_min
-        self.learning_rate_max = learning_rate_max
 
         # PPO components
         self.actor_critic = actor_critic
@@ -223,9 +223,13 @@ class PPO:
                         kl_mean = (kl * valid_mask).sum() / (valid_mask.sum() + 1e-8)
 
                         if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(self.learning_rate_min, self.learning_rate / 1.5)
+                            self.learning_rate /= 1.5
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(self.learning_rate_max, self.learning_rate * 1.5)
+                            self.learning_rate *= 1.5
+                        self.learning_rate = max(
+                            self.learning_rate_min,
+                            min(self.learning_rate, self.learning_rate_max),
+                        )
                         
                         for param_group in self.optimizer.param_groups:
                             param_group['lr'] = self.learning_rate
