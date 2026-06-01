@@ -220,6 +220,7 @@ def _run_with_sim_app(args):
             terrain_rows=1,
             terrain_cols=1,
             obstacle_level=args.eval_obstacle_level if args.scenario == "hard_room_eval" else 0,
+            terrain_difficulty_range=(1.0, 1.0) if args.scenario == "hard_room_eval" else None,
             preset_room=spec["room"],
             randomize_friction=False,
             randomize_base_mass=True,

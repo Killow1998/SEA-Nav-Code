@@ -509,6 +509,7 @@ def make_sea_nav_env_cfg(
     friction_range: tuple[float, float] = (-0.2, 1.25),
     randomize_base_mass: bool = True,
     added_mass_range: tuple[float, float] = (-1.5, 1.5),
+    terrain_difficulty_range: tuple[float, float] | None = None,
     preset_room: np.ndarray | None = None,
     preset_start_goal_cases: list[dict[str, object]] | None = None,
     preset_start_goal_case_prob: float = 1.0,
@@ -571,6 +572,7 @@ def make_sea_nav_env_cfg(
             horizontal_scale=cfg.room_resolution,
             vertical_scale=0.005,
             slope_threshold=0.75,
+            difficulty_range=terrain_difficulty_range if terrain_difficulty_range is not None else (0.0, 1.0),
             use_cache=False,
             sub_terrains={
                 "hard_room": SeaNavRoomTerrainCfg(
