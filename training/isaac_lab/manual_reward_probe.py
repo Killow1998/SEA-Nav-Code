@@ -249,7 +249,10 @@ def _run_with_sim_app(args):
                 args.fixed_start_cell = f"{fixed_start_cell[0]},{fixed_start_cell[1]}"
                 args.fixed_goal_cell = f"{fixed_goal_cell[0]},{fixed_goal_cell[1]}"
                 args.fixed_start_yaw = fixed_start_yaw
-            summary, trace_rows, room_map = _run_hard_room_eval(env, args, policy_fn, command_fn)
+            if _can_vectorize_hard_room_eval(args, policy_fn, command_fn):
+                summary, trace_rows, room_map = _run_hard_room_eval_vectorized(env, args, policy_fn)
+            else:
+                summary, trace_rows, room_map = _run_hard_room_eval(env, args, policy_fn, command_fn)
             _write_summary(log_dir, summary, trace_rows, room_map=room_map)
             print(f"[PROBE] scenario={args.scenario} log_dir={log_dir}")
             print(json.dumps(summary, indent=2, ensure_ascii=True))
@@ -1219,8 +1222,349 @@ def _classify_stand_diagnostic(diagnostics):
     return "mixed_or_unknown"
 
 
+def _can_vectorize_hard_room_eval(args, policy_fn, command_fn):
+    return (
+        args.scenario == "hard_room_eval"
+        and args.num_envs > 1
+        and policy_fn is not None
+        and command_fn is None
+        and not args.case_trace
+        and not args.fixed_start_cell
+        and not args.fixed_goal_cell
+        and not args.trace_steps
+        and not args.record_topdown_video
+        and not args.record_frame_dir
+        and not args.show_topdown_camera
+        and not args.show_start_goal_markers
+        and args.policy_turn_yaw_threshold < 0.0
+        and args.policy_path_blend_weight < 0.0
+    )
+
+
+def _new_vector_episode_state(env, env_id, episode_idx):
+    start_local_xy = (
+        env._robot.data.root_pos_w[env_id, 0].item() - env._terrain.env_origins[env_id, 0].item(),
+        env._robot.data.root_pos_w[env_id, 1].item() - env._terrain.env_origins[env_id, 1].item(),
+    )
+    goal_local_xy = (
+        env.position_targets[env_id, 0].item() - env._terrain.env_origins[env_id, 0].item(),
+        env.position_targets[env_id, 1].item() - env._terrain.env_origins[env_id, 1].item(),
+    )
+    return {
+        "episode": episode_idx,
+        "start_cell": list(_local_xy_to_cell(start_local_xy)),
+        "goal_cell": list(_local_xy_to_cell(goal_local_xy)),
+        "start_yaw": _yaw_from_quat(env._robot.data.root_quat_w[env_id].tolist()),
+        "reward_sum": 0.0,
+        "reach_reward_sum": 0.0,
+        "min_distance": float("inf"),
+        "first_reach_step": None,
+        "step": 0,
+        "previous_distance": None,
+        "policy_command_abs_hist": [],
+        "nav_action_abs_hist": [],
+        "low_level_command_abs_hist": [],
+        "body_speed_hist": [],
+        "abs_yaw_rate_hist": [],
+        "distance_hist": [],
+        "distance_progress_hist": [],
+        "policy_command_vec_hist": [],
+        "nav_action_vec_hist": [],
+        "low_level_command_vec_hist": [],
+        "body_velocity_vec_hist": [],
+    }
+
+
+def _finalize_vector_episode(state, done_step, done_reason, done_flags, episode_summary=None):
+    action_diagnostics = {
+        "tail_window_steps": 50,
+        "mean_policy_command_abs_tail50": _mean_tail(state["policy_command_abs_hist"]),
+        "mean_nav_action_abs_tail50": _mean_tail(state["nav_action_abs_hist"]),
+        "mean_low_level_command_abs_tail50": _mean_tail(state["low_level_command_abs_hist"]),
+        "mean_body_speed_tail50": _mean_tail(state["body_speed_hist"]),
+        "mean_abs_yaw_rate_tail50": _mean_tail(state["abs_yaw_rate_hist"]),
+        "mean_distance_tail50": _mean_tail(state["distance_hist"]),
+        "mean_distance_progress_tail50": _mean_tail(state["distance_progress_hist"]),
+        "mean_policy_command_tail50": _mean_vector_tail(state["policy_command_vec_hist"]),
+        "mean_nav_action_tail50": _mean_vector_tail(state["nav_action_vec_hist"]),
+        "mean_low_level_command_tail50": _mean_vector_tail(state["low_level_command_vec_hist"]),
+        "mean_body_velocity_tail50": _mean_vector_tail(state["body_velocity_vec_hist"]),
+        "last_policy_command": state["policy_command_vec_hist"][-1] if state["policy_command_vec_hist"] else None,
+        "last_nav_action": state["nav_action_vec_hist"][-1] if state["nav_action_vec_hist"] else None,
+        "last_low_level_command": state["low_level_command_vec_hist"][-1] if state["low_level_command_vec_hist"] else None,
+        "last_body_velocity": state["body_velocity_vec_hist"][-1] if state["body_velocity_vec_hist"] else None,
+    }
+    if done_reason == "stand":
+        action_diagnostics["stand_classification"] = _classify_stand_diagnostic(action_diagnostics)
+    return {
+        "episode": state["episode"],
+        "start_cell": state["start_cell"],
+        "goal_cell": state["goal_cell"],
+        "start_yaw": state["start_yaw"],
+        "reward_sum": state["reward_sum"],
+        "reach_reward_sum": state["reach_reward_sum"],
+        "min_distance": None if state["min_distance"] == float("inf") else state["min_distance"],
+        "first_reach_step": state["first_reach_step"],
+        "done_step": done_step,
+        "done_reason": done_reason,
+        "done_flags": done_flags,
+        "episode_summary": episode_summary,
+        "action_diagnostics": action_diagnostics,
+    }
+
+
+def _reset_vector_eval_env(env, env_id):
+    import torch
+
+    env_ids = torch.tensor([env_id], dtype=torch.long, device=env.device)
+    env._reset_idx(env_ids)
+    env.scene.write_data_to_sim()
+    env.sim.forward()
+    env.scene.update(dt=0.0)
+
+
+def _run_hard_room_eval_vectorized(env, args, policy_fn):
+    import torch
+
+    if args.episodes <= 0:
+        raise ValueError("--episodes must be positive")
+    if env.num_envs <= 1:
+        raise ValueError("vectorized hard_room_eval requires --num-envs > 1")
+
+    room_map = env.room_maps[0, 0].detach().cpu().numpy()
+    obs_dict, _ = env.reset()
+    policy_obs = obs_dict["policy"]
+
+    episode_rows = []
+    states = [None for _ in range(env.num_envs)]
+    next_episode_idx = 0
+    initial_slots = min(env.num_envs, args.episodes)
+    for env_id in range(initial_slots):
+        states[env_id] = _new_vector_episode_state(env, env_id, next_episode_idx)
+        next_episode_idx += 1
+
+    success_count = 0
+    collision_failures = 0
+    timeout_failures = 0
+    stand_failures = 0
+    fall_failures = 0
+    truncated_failures = 0
+    max_step_failures = 0
+    total_reward_sum = 0.0
+    total_reach_reward_sum = 0.0
+    min_distance_values = []
+    stand_diagnostic_counts = {}
+    active_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    while len(episode_rows) < args.episodes:
+        active_indices = [idx for idx, state in enumerate(states) if state is not None]
+        if not active_indices:
+            break
+        active_mask.zero_()
+        active_mask[torch.tensor(active_indices, dtype=torch.long, device=env.device)] = True
+
+        with torch.inference_mode():
+            command = policy_fn(policy_obs)
+        if args.policy_stop_radius >= 0.0:
+            stop_mask = env.distance <= args.policy_stop_radius
+            if args.policy_stop_mode == "zero":
+                command = torch.where(stop_mask.unsqueeze(1), torch.zeros_like(command), command)
+            else:
+                scales = (env.distance / args.policy_stop_radius).clamp(0.0, 1.0).unsqueeze(1)
+                command = torch.where(stop_mask.unsqueeze(1), command * scales, command)
+        command = torch.where(active_mask.unsqueeze(1), command, torch.zeros_like(command))
+
+        raw_command = command.detach().clone()
+        body_velocity = env._robot.data.root_lin_vel_b.detach().clone()
+        yaw_rate = env._robot.data.root_ang_vel_b[:, 2].detach().clone()
+        obs_dict, rewards, terminated, truncated, extras = env.step(command)
+        policy_obs = obs_dict["policy"]
+
+        reach_rewards = env.last_reward_terms["reach_pos_target_tight"].detach().clone()
+        distances = env.last_distance.detach().clone()
+        nav_actions = env.nav_actions_orig.detach().clone()
+        low_level_commands = env.slr_commands.detach().clone()
+        done_mask = (terminated | truncated).detach().clone()
+
+        for env_id in active_indices:
+            state = states[env_id]
+            if state is None:
+                continue
+            reward_value = float(rewards[env_id].item())
+            reach_reward_value = float(reach_rewards[env_id].item())
+            distance_value = float(distances[env_id].item())
+            raw_command_vec = [float(x) for x in raw_command[env_id].tolist()]
+            nav_action_vec = [float(x) for x in nav_actions[env_id].tolist()]
+            low_level_command_vec = [float(x) for x in low_level_commands[env_id].tolist()]
+            body_velocity_vec = [float(x) for x in body_velocity[env_id].tolist()]
+            body_speed_value = math.sqrt(body_velocity_vec[0] ** 2 + body_velocity_vec[1] ** 2)
+            yaw_rate_value = float(yaw_rate[env_id].item())
+
+            if state["previous_distance"] is not None:
+                state["distance_progress_hist"].append(state["previous_distance"] - distance_value)
+            state["previous_distance"] = distance_value
+            state["policy_command_abs_hist"].append(sum(abs(x) for x in raw_command_vec) / len(raw_command_vec))
+            state["nav_action_abs_hist"].append(sum(abs(x) for x in nav_action_vec) / len(nav_action_vec))
+            state["low_level_command_abs_hist"].append(
+                sum(abs(x) for x in low_level_command_vec) / len(low_level_command_vec)
+            )
+            state["body_speed_hist"].append(body_speed_value)
+            state["abs_yaw_rate_hist"].append(abs(yaw_rate_value))
+            state["distance_hist"].append(distance_value)
+            state["policy_command_vec_hist"].append(raw_command_vec)
+            state["nav_action_vec_hist"].append(nav_action_vec)
+            state["low_level_command_vec_hist"].append(low_level_command_vec)
+            state["body_velocity_vec_hist"].append(body_velocity_vec)
+            state["reward_sum"] += reward_value
+            state["reach_reward_sum"] += reach_reward_value
+            state["min_distance"] = min(state["min_distance"], distance_value)
+            if state["first_reach_step"] is None and reach_reward_value > 0.0:
+                state["first_reach_step"] = state["step"]
+
+        done_ids = [idx for idx in active_indices if bool(done_mask[idx].item())]
+        for env_id in done_ids:
+            state = states[env_id]
+            if state is None or len(episode_rows) >= args.episodes:
+                states[env_id] = None
+                continue
+            done_flags = {
+                "contact": bool(env.last_done_contact[env_id].item()),
+                "goal_hold": bool(env.last_done_goal_hold[env_id].item()),
+                "stand": bool(env.last_done_stand[env_id].item()),
+                "fall": bool(env.last_done_fall[env_id].item()),
+                "timeout": bool(env.last_done_timeout[env_id].item()),
+            }
+            if done_flags["goal_hold"]:
+                done_reason = "goal_hold"
+                success_count += 1
+            elif done_flags["contact"]:
+                done_reason = "contact"
+                collision_failures += 1
+            elif done_flags["timeout"] or bool(truncated[env_id].item()):
+                done_reason = "timeout"
+                timeout_failures += 1
+                if bool(truncated[env_id].item()):
+                    truncated_failures += 1
+            elif done_flags["stand"]:
+                done_reason = "stand"
+                stand_failures += 1
+            elif done_flags["fall"]:
+                done_reason = "fall"
+                fall_failures += 1
+            else:
+                done_reason = "terminated"
+
+            row = _finalize_vector_episode(state, state["step"], done_reason, done_flags)
+            if done_reason == "stand":
+                classification = row["action_diagnostics"].get("stand_classification", "insufficient_data")
+                stand_diagnostic_counts[classification] = stand_diagnostic_counts.get(classification, 0) + 1
+            episode_rows.append(row)
+            total_reward_sum += state["reward_sum"]
+            total_reach_reward_sum += state["reach_reward_sum"]
+            if state["min_distance"] != float("inf"):
+                min_distance_values.append(state["min_distance"])
+
+            if next_episode_idx < args.episodes:
+                states[env_id] = _new_vector_episode_state(env, env_id, next_episode_idx)
+                next_episode_idx += 1
+            else:
+                states[env_id] = None
+
+        manual_reset_happened = False
+        for env_id in active_indices:
+            if states[env_id] is not None:
+                states[env_id]["step"] += 1
+                if states[env_id]["step"] >= args.max_steps:
+                    if len(episode_rows) >= args.episodes:
+                        states[env_id] = None
+                        continue
+                    state = states[env_id]
+                    row = _finalize_vector_episode(
+                        state,
+                        args.max_steps - 1,
+                        "max_steps",
+                        {
+                            "contact": False,
+                            "goal_hold": False,
+                            "stand": False,
+                            "fall": False,
+                            "timeout": False,
+                        },
+                    )
+                    episode_rows.append(row)
+                    max_step_failures += 1
+                    total_reward_sum += state["reward_sum"]
+                    total_reach_reward_sum += state["reach_reward_sum"]
+                    if state["min_distance"] != float("inf"):
+                        min_distance_values.append(state["min_distance"])
+                    if next_episode_idx < args.episodes:
+                        _reset_vector_eval_env(env, env_id)
+                        manual_reset_happened = True
+                        states[env_id] = _new_vector_episode_state(env, env_id, next_episode_idx)
+                        next_episode_idx += 1
+                    else:
+                        states[env_id] = None
+        if manual_reset_happened:
+            policy_obs = env._get_observations()["policy"]
+
+    episode_rows = sorted(episode_rows[: args.episodes], key=lambda row: row["episode"])
+    episodes = max(1, args.episodes)
+    collision_free_success_count = sum(
+        1 for row in episode_rows if row["done_reason"] == "goal_hold" and not row["done_flags"]["contact"]
+    )
+    summary = {
+        "scenario": args.scenario,
+        "controller_mode": args.controller_mode,
+        "actuator_mode": args.actuator_mode,
+        "robot_asset_source": args.robot_asset_source,
+        "checkpoint": args.checkpoint if args.checkpoint else None,
+        "episodes": args.episodes,
+        "num_envs": env.num_envs,
+        "eval_parallel": True,
+        "eval_obstacle_level": args.eval_obstacle_level,
+        "max_steps": args.max_steps,
+        "episode_length_s": args.episode_length_s,
+        "nav_action_scale": list(args.nav_action_scale),
+        "stay_steps": args.stay_steps,
+        "disable_contact_termination": args.disable_contact_termination,
+        "fixed_start_cell": None,
+        "fixed_goal_cell": None,
+        "fixed_start_yaw": None,
+        "trace_steps": False,
+        "policy_stop_radius": args.policy_stop_radius if args.policy_stop_radius >= 0.0 else None,
+        "policy_stop_mode": args.policy_stop_mode if args.policy_stop_radius >= 0.0 else None,
+        "policy_turn_yaw_threshold": None,
+        "policy_turn_forward_floor_pos": None,
+        "policy_turn_forward_floor_neg": None,
+        "policy_path_blend_weight": None,
+        "policy_path_blend_min_distance": None,
+        "success_count": success_count,
+        "collision_free_success_count": collision_free_success_count,
+        "collision_failures": collision_failures,
+        "timeout_failures": timeout_failures,
+        "stand_failures": stand_failures,
+        "fall_failures": fall_failures,
+        "truncated_failures": truncated_failures,
+        "max_step_failures": max_step_failures,
+        "stand_diagnostic_counts": stand_diagnostic_counts,
+        "success_rate": success_count / episodes,
+        "collision_free_success_rate": collision_free_success_count / episodes,
+        "collision_failure_rate": collision_failures / episodes,
+        "mean_reward_sum": total_reward_sum / episodes,
+        "mean_reach_reward_sum": total_reach_reward_sum / episodes,
+        "mean_min_distance": None if not min_distance_values else sum(min_distance_values) / len(min_distance_values),
+    }
+    return summary, episode_rows, room_map
+
+
 def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
     import torch
+
+    if env.num_envs != 1:
+        raise ValueError(
+            "serial hard_room_eval requires --num-envs 1. "
+            "Use policy mode without trace/recording/fixed cases to enable vectorized eval."
+        )
 
     room_map = env.room_maps[0, 0].detach().cpu().numpy()
     episode_rows = []
