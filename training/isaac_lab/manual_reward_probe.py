@@ -1184,6 +1184,41 @@ def _maybe_prepare_path_follow(env, args, fixed_start_cell, fixed_goal_cell):
     env._probe_path_lookahead = args.path_lookahead
 
 
+def _mean_tail(values, tail=50):
+    if not values:
+        return None
+    clipped = values[-tail:]
+    return float(sum(clipped) / len(clipped))
+
+
+def _mean_vector_tail(values, tail=50):
+    if not values:
+        return None
+    clipped = values[-tail:]
+    width = len(clipped[0])
+    return [float(sum(row[i] for row in clipped) / len(clipped)) for i in range(width)]
+
+
+def _classify_stand_diagnostic(diagnostics):
+    raw = diagnostics.get("mean_policy_command_abs_tail50")
+    low_level = diagnostics.get("mean_low_level_command_abs_tail50")
+    speed = diagnostics.get("mean_body_speed_tail50")
+    yaw = diagnostics.get("mean_abs_yaw_rate_tail50")
+    progress = diagnostics.get("mean_distance_progress_tail50")
+    if raw is None or low_level is None or speed is None or yaw is None:
+        return "insufficient_data"
+    motion = speed + 0.5 * yaw
+    if raw < 0.05:
+        return "high_level_idle"
+    if raw >= 0.10 and low_level < 0.05:
+        return "command_suppressed_after_policy"
+    if low_level >= 0.10 and motion < 0.12:
+        return "low_level_not_tracking_or_blocked"
+    if motion >= 0.12 and progress is not None and progress < 0.002:
+        return "moving_without_progress"
+    return "mixed_or_unknown"
+
+
 def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
     import torch
 
@@ -1200,6 +1235,7 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
     total_reward_sum = 0.0
     total_reach_reward_sum = 0.0
     min_distance_values = []
+    stand_diagnostic_counts = {}
     fixed_start_cell = _parse_cell_arg(args.fixed_start_cell)
     fixed_goal_cell = _parse_cell_arg(args.fixed_goal_cell)
     if (fixed_start_cell is None) != (fixed_goal_cell is None):
@@ -1279,6 +1315,18 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
             "fall": False,
             "timeout": False,
         }
+        policy_command_abs_hist = []
+        nav_action_abs_hist = []
+        low_level_command_abs_hist = []
+        body_speed_hist = []
+        abs_yaw_rate_hist = []
+        distance_hist = []
+        distance_progress_hist = []
+        policy_command_vec_hist = []
+        nav_action_vec_hist = []
+        low_level_command_vec_hist = []
+        body_velocity_vec_hist = []
+        previous_distance_value = None
 
         for step_idx in range(args.max_steps):
             if policy_fn is not None:
@@ -1297,6 +1345,7 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
                 else:
                     scale = max(0.0, min(1.0, env.distance[0].item() / args.policy_stop_radius))
                     command = command * scale
+            raw_command_vec = [float(x) for x in command[0].tolist()]
             obs_dict, rewards, terminated, truncated, extras = env.step(command)
             if policy_fn is not None:
                 policy_obs = obs_dict["policy"]
@@ -1311,6 +1360,24 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
             yaw_value = _yaw_from_quat(env.last_root_quat_w[0].tolist())
             local_x = (env.last_root_pos_w[0, 0] - env._terrain.env_origins[0, 0]).item()
             local_y = (env.last_root_pos_w[0, 1] - env._terrain.env_origins[0, 1]).item()
+            nav_action_vec = [float(x) for x in env.nav_actions_orig[0].tolist()]
+            low_level_command_vec = [float(x) for x in env.slr_commands[0].tolist()]
+            body_velocity_vec = [float(x) for x in env._robot.data.root_lin_vel_b[0].tolist()]
+            yaw_rate_value = float(env._robot.data.root_ang_vel_b[0, 2].item())
+            body_speed_value = math.sqrt(body_velocity_vec[0] ** 2 + body_velocity_vec[1] ** 2)
+            if previous_distance_value is not None:
+                distance_progress_hist.append(previous_distance_value - distance_value)
+            previous_distance_value = distance_value
+            policy_command_abs_hist.append(sum(abs(x) for x in raw_command_vec) / len(raw_command_vec))
+            nav_action_abs_hist.append(sum(abs(x) for x in nav_action_vec) / len(nav_action_vec))
+            low_level_command_abs_hist.append(sum(abs(x) for x in low_level_command_vec) / len(low_level_command_vec))
+            body_speed_hist.append(body_speed_value)
+            abs_yaw_rate_hist.append(abs(yaw_rate_value))
+            distance_hist.append(distance_value)
+            policy_command_vec_hist.append(raw_command_vec)
+            nav_action_vec_hist.append(nav_action_vec)
+            low_level_command_vec_hist.append(low_level_command_vec)
+            body_velocity_vec_hist.append(body_velocity_vec)
             episode_reward_sum += reward_value
             episode_reach_reward_sum += reach_reward_value
             min_distance = min(min_distance, distance_value)
@@ -1325,10 +1392,10 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
                     {
                         "step": step_idx,
                         "episode_idx": episode_idx,
-                        "command": [float(x) for x in command[0].tolist()],
-                        "nav_action_scaled": [float(x) for x in env.nav_actions_orig[0].tolist()],
-                        "low_level_command": [float(x) for x in env.slr_commands[0].tolist()],
-                        "root_lin_vel_b": [float(x) for x in env._robot.data.root_lin_vel_b[0].tolist()],
+                        "command": raw_command_vec,
+                        "nav_action_scaled": nav_action_vec,
+                        "low_level_command": low_level_command_vec,
+                        "root_lin_vel_b": body_velocity_vec,
                         "root_ang_vel_b": [float(x) for x in env._robot.data.root_ang_vel_b[0].tolist()],
                         "stay_timer": int(env.stay_timer[0].item()),
                         "goal_hold_timer": int(env.goal_hold_timer[0].item()),
@@ -1388,6 +1455,28 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
         total_reach_reward_sum += episode_reach_reward_sum
         if min_distance != float("inf"):
             min_distance_values.append(min_distance)
+        action_diagnostics = {
+            "tail_window_steps": 50,
+            "mean_policy_command_abs_tail50": _mean_tail(policy_command_abs_hist),
+            "mean_nav_action_abs_tail50": _mean_tail(nav_action_abs_hist),
+            "mean_low_level_command_abs_tail50": _mean_tail(low_level_command_abs_hist),
+            "mean_body_speed_tail50": _mean_tail(body_speed_hist),
+            "mean_abs_yaw_rate_tail50": _mean_tail(abs_yaw_rate_hist),
+            "mean_distance_tail50": _mean_tail(distance_hist),
+            "mean_distance_progress_tail50": _mean_tail(distance_progress_hist),
+            "mean_policy_command_tail50": _mean_vector_tail(policy_command_vec_hist),
+            "mean_nav_action_tail50": _mean_vector_tail(nav_action_vec_hist),
+            "mean_low_level_command_tail50": _mean_vector_tail(low_level_command_vec_hist),
+            "mean_body_velocity_tail50": _mean_vector_tail(body_velocity_vec_hist),
+            "last_policy_command": policy_command_vec_hist[-1] if policy_command_vec_hist else None,
+            "last_nav_action": nav_action_vec_hist[-1] if nav_action_vec_hist else None,
+            "last_low_level_command": low_level_command_vec_hist[-1] if low_level_command_vec_hist else None,
+            "last_body_velocity": body_velocity_vec_hist[-1] if body_velocity_vec_hist else None,
+        }
+        if done_reason == "stand":
+            stand_classification = _classify_stand_diagnostic(action_diagnostics)
+            action_diagnostics["stand_classification"] = stand_classification
+            stand_diagnostic_counts[stand_classification] = stand_diagnostic_counts.get(stand_classification, 0) + 1
         episode_rows.append(
             {
                 "episode": episode_idx,
@@ -1402,6 +1491,7 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
                 "done_reason": done_reason,
                 "done_flags": done_flags,
                 "episode_summary": episode_summary,
+                "action_diagnostics": action_diagnostics,
             }
         )
 
@@ -1444,6 +1534,7 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
         "fall_failures": fall_failures,
         "truncated_failures": truncated_failures,
         "max_step_failures": max_step_failures,
+        "stand_diagnostic_counts": stand_diagnostic_counts,
         "success_rate": success_count / episodes,
         "collision_free_success_rate": collision_free_success_count / episodes,
         "collision_failure_rate": collision_failures / episodes,
