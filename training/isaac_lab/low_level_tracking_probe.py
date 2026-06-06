@@ -40,6 +40,7 @@ def _parse_args():
         type=str,
         default=str(REPO_ROOT / "training" / "isaac_lab" / "low_level_policies" / "robotlab_go2_flat_20260527" / "policy.pt"),
     )
+    parser.add_argument("--robotlab-command-clip", type=float, default=1.0)
     parser.add_argument("--robot-asset-source", choices=("converted_urdf", "native_go2"), default="converted_urdf")
     parser.add_argument("--sim-device", type=str, default="cuda:0")
     parser.add_argument("--usd-dir", type=str, default=str(DEFAULT_USD_DIR))
@@ -166,6 +167,7 @@ def main():
             randomize_base_mass=True,
             added_mass_range=(0.0, 0.0),
         )
+        env_cfg.robotlab_command_clip = args.robotlab_command_clip
         env_cfg.sim.device = args.sim_device
         env_cfg.add_noise = False
         env = SeaNavIsaacLabEnv(cfg=env_cfg, render_mode=None)
@@ -242,6 +244,14 @@ def main():
                 "samples": len(rows),
                 "done_step": done_step,
                 "done_reason": done_reason,
+                "done_flags": {
+                    "contact": bool(env.last_done_contact[0].item()),
+                    "goal_hold": bool(env.last_done_goal_hold[0].item()),
+                    "stand": bool(env.last_done_stand[0].item()),
+                    "fall": bool(env.last_done_fall[0].item()),
+                    "timeout": bool(env.last_done_timeout[0].item()),
+                    "collision_occurred": bool(env.collision_occurred[0].item()),
+                },
                 "filtered_command_mean": {
                     "vx": _tensor_mean(steady_rows, "filtered_vx") if steady_rows else None,
                     "vy": _tensor_mean(steady_rows, "filtered_vy") if steady_rows else None,
@@ -262,6 +272,10 @@ def main():
                     "vy": _tensor_rmse(steady_rows, "actual_vy", "filtered_vy") if steady_rows else None,
                     "wz": _tensor_rmse(steady_rows, "actual_wz", "filtered_wz") if steady_rows else None,
                 },
+                "terminal_state": {
+                    "projected_gravity_b_z": float(env._robot.data.projected_gravity_b[0, 2].item()),
+                    "root_height": float(env._robot.data.root_pos_w[0, 2].item()),
+                },
                 "final_pose": rows[-1] if rows else None,
             }
             all_traces[profile["name"]] = rows
@@ -274,6 +288,7 @@ def main():
             "robot_asset_source": args.robot_asset_source,
             "low_level_controller": args.low_level_controller,
             "robotlab_low_level_policy": args.robotlab_low_level_policy,
+            "robotlab_command_clip": args.robotlab_command_clip,
             "settle_steps": args.settle_steps,
             "warmup_steps": args.warmup_steps,
             "measure_steps": args.measure_steps,

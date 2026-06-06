@@ -291,6 +291,7 @@ def _parse_args():
         type=str,
         default=str(REPO_ROOT / "training" / "isaac_lab" / "low_level_policies" / "robotlab_go2_flat_20260527" / "policy.pt"),
     )
+    parser.add_argument("--robotlab-command-clip", type=float, default=1.0)
     parser.add_argument("--robot-asset-source", choices=("converted_urdf", "native_go2"), default="converted_urdf")
     parser.add_argument("--sim-device", type=str, default="cuda:0")
     parser.add_argument("--rl-device", type=str, default="cuda:0")
@@ -605,6 +606,7 @@ def main():
             preset_start_goal_cases=preset_start_goal_cases,
             preset_start_goal_case_prob=args.preset_case_prob,
         )
+        env_cfg.robotlab_command_clip = args.robotlab_command_clip
         env_cfg.sim.device = args.sim_device
         if args.disable_obs_noise:
             env_cfg.add_noise = False

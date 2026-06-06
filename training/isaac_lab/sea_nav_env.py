@@ -496,6 +496,7 @@ def make_sea_nav_env_cfg(
     turn_forward_floor_neg: float = -1.0,
     low_level_controller: str = "sea_nav_jit",
     robotlab_policy_path: str = str(ROBOTLAB_LOW_LEVEL_POLICY_PATH),
+    robotlab_command_clip: float = 1.0,
     reward_scale_termination: float = -100.0,
     reward_scale_collision: float = -4.0,
     reward_scale_close_obst_vel: float = 5.0,
@@ -530,6 +531,7 @@ def make_sea_nav_env_cfg(
     cfg.turn_forward_floor_neg = turn_forward_floor_neg
     cfg.low_level_controller = low_level_controller
     cfg.robotlab_policy_path = robotlab_policy_path
+    cfg.robotlab_command_clip = robotlab_command_clip
     cfg.reward_scale_termination = reward_scale_termination
     cfg.reward_scale_collision = reward_scale_collision
     cfg.reward_scale_close_obst_vel = reward_scale_close_obst_vel

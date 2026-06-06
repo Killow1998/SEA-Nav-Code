@@ -1,0 +1,1 @@
+/home/user/rl_ws/robot_lab/logs/rsl_rl/unitree_go2_flat/2026-06-04_16-42-38_codex_go2_highyaw_20260604/model_14900.pt

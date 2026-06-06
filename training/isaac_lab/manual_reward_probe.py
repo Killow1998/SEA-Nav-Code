@@ -76,6 +76,7 @@ def build_arg_parser():
         type=str,
         default=str(REPO_ROOT / "training" / "isaac_lab" / "low_level_policies" / "robotlab_go2_flat_20260527" / "policy.pt"),
     )
+    parser.add_argument("--robotlab-command-clip", type=float, default=1.0)
     parser.add_argument("--robot-asset-source", choices=("converted_urdf", "native_go2"), default="converted_urdf")
     parser.add_argument("--sim-device", type=str, default="cuda:0")
     parser.add_argument("--usd-dir", type=str, default=str(DEFAULT_USD_DIR))
@@ -215,6 +216,7 @@ def _run_with_sim_app(args):
             robot_asset_source=args.robot_asset_source,
             low_level_controller=args.low_level_controller,
             robotlab_policy_path=args.robotlab_low_level_policy,
+            robotlab_command_clip=args.robotlab_command_clip,
             episode_length_s=args.episode_length_s,
             nav_action_scale=tuple(args.nav_action_scale),
             terrain_rows=1,
@@ -365,6 +367,7 @@ def _run_with_sim_app(args):
             "robot_asset_source": args.robot_asset_source,
             "low_level_controller": args.low_level_controller,
             "robotlab_low_level_policy": args.robotlab_low_level_policy,
+            "robotlab_command_clip": args.robotlab_command_clip,
             "checkpoint": args.checkpoint if args.checkpoint else None,
             "stay_steps": args.stay_steps,
             "disable_contact_termination": args.disable_contact_termination,
@@ -1517,6 +1520,9 @@ def _run_hard_room_eval_vectorized(env, args, policy_fn):
         "controller_mode": args.controller_mode,
         "actuator_mode": args.actuator_mode,
         "robot_asset_source": args.robot_asset_source,
+        "low_level_controller": args.low_level_controller,
+        "robotlab_low_level_policy": args.robotlab_low_level_policy,
+        "robotlab_command_clip": args.robotlab_command_clip,
         "checkpoint": args.checkpoint if args.checkpoint else None,
         "episodes": args.episodes,
         "num_envs": env.num_envs,
@@ -1851,6 +1857,9 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
         "controller_mode": args.controller_mode,
         "actuator_mode": args.actuator_mode,
         "robot_asset_source": args.robot_asset_source,
+        "low_level_controller": args.low_level_controller,
+        "robotlab_low_level_policy": args.robotlab_low_level_policy,
+        "robotlab_command_clip": args.robotlab_command_clip,
         "checkpoint": args.checkpoint if args.checkpoint else None,
         "episodes": args.episodes,
         "eval_obstacle_level": args.eval_obstacle_level,
