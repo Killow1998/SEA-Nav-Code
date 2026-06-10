@@ -64,6 +64,12 @@ DEFAULT_JOINT_ANGLES = {
     "RR_calf_joint": -1.5,
 }
 
+GO2_URDF_EFFORT_LIMITS = {
+    "hip": 23.7,
+    "thigh": 23.7,
+    "calf": 45.43,
+}
+
 
 def is_path_with_obstacle(room: np.ndarray, robot_pos: list[int], goal_pos: list[int]) -> bool:
     x1, y1 = robot_pos
@@ -805,7 +811,18 @@ class SeaNavIsaacLabEnv(DirectRLEnv):
             (1, self._robot.num_joints), self.cfg.joint_damping, dtype=torch.float, device=self.device
         )
         sim_torque_limits_live = self._robot.root_physx_view.get_dof_max_forces()[0].to(self.device)
-        fallback_torque_limits = torch.full_like(sim_torque_limits_live, self.cfg.joint_effort_limit)
+        fallback_torque_limits = torch.tensor(
+            [
+                GO2_URDF_EFFORT_LIMITS["hip"]
+                if "hip" in name
+                else GO2_URDF_EFFORT_LIMITS["thigh"]
+                if "thigh" in name
+                else GO2_URDF_EFFORT_LIMITS["calf"]
+                for name in self.live_joint_names
+            ],
+            dtype=torch.float,
+            device=self.device,
+        )
         valid_torque_limits = sim_torque_limits_live > 0.0
         clipped_torque_limits_live = torch.minimum(sim_torque_limits_live, fallback_torque_limits)
         clipped_torque_limits_live = torch.where(valid_torque_limits, clipped_torque_limits_live, fallback_torque_limits)

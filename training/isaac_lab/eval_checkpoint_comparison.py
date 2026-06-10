@@ -20,6 +20,32 @@ ROOM_RESOLUTION = 0.1
 CONTROL_DT = 0.02
 
 
+def _apply_eval_protocol(args: argparse.Namespace) -> None:
+    if args.eval_protocol == "custom":
+        return
+    if args.eval_protocol == "strict_env":
+        args.episode_length_s = 60.0
+        args.max_steps = 3000
+        args.stay_steps = 150
+        args.disable_contact_termination = False
+        args.policy_stop_radius = -1.0
+    elif args.eval_protocol == "official_play_style":
+        args.episode_length_s = 40.0
+        args.max_steps = 2000
+        args.stay_steps = 500
+        args.disable_contact_termination = True
+        args.policy_stop_radius = -1.0
+    elif args.eval_protocol == "assist_stop":
+        args.episode_length_s = 40.0
+        args.max_steps = 2000
+        args.stay_steps = 500
+        args.disable_contact_termination = True
+        args.policy_stop_radius = 0.45
+        args.policy_stop_mode = "zero"
+    else:
+        raise ValueError(f"Unsupported eval protocol: {args.eval_protocol}")
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     label: str
@@ -99,7 +125,7 @@ def _mean(values: list[float]) -> float | None:
     return None if not values else sum(values) / len(values)
 
 
-def _summarize_run(model: ModelSpec, level: int, run_dir: Path) -> dict:
+def _summarize_run(args: argparse.Namespace, model: ModelSpec, level: int, run_dir: Path) -> dict:
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     rows = _load_jsonl(run_dir / "trace.jsonl")
     speeds = [value for row in rows if (value := _effective_speed(row)) is not None]
@@ -107,8 +133,17 @@ def _summarize_run(model: ModelSpec, level: int, run_dir: Path) -> dict:
     return {
         "model": model.label,
         "checkpoint": str(model.checkpoint),
-        "low_level_policy": str(model.low_level_policy),
-        "robotlab_command_clip": model.command_clip,
+        "repro_mode": args.repro_mode,
+        "eval_protocol": args.eval_protocol,
+        "actuator_mode": args.actuator_mode,
+        "robot_asset_source": args.robot_asset_source,
+        "low_level_controller": args.low_level_controller,
+        "low_level_policy": str(model.low_level_policy) if args.low_level_controller == "robotlab" else None,
+        "robotlab_command_clip": model.command_clip if args.low_level_controller == "robotlab" else None,
+        "cbf_fov_deg": args.cbf_fov_deg,
+        "episode_length_s": args.episode_length_s,
+        "stay_steps": args.stay_steps,
+        "disable_contact_termination": args.disable_contact_termination,
         "level": level,
         "episodes": summary.get("episodes"),
         "success_count": summary.get("success_count"),
@@ -130,7 +165,7 @@ def _run_eval(args: argparse.Namespace, model: ModelSpec, level: int) -> Path:
     low_level_policy = model.low_level_policy if model.low_level_policy.is_absolute() else REPO_ROOT / model.low_level_policy
     if not checkpoint.is_file():
         raise FileNotFoundError(f"checkpoint not found: {checkpoint}")
-    if not low_level_policy.is_file():
+    if args.low_level_controller == "robotlab" and not low_level_policy.is_file():
         raise FileNotFoundError(f"low-level policy not found: {low_level_policy}")
 
     log_root = REPO_ROOT / "logs" / "isaac_lab" / args.comparison_name / model.label / f"level_{level}"
@@ -146,6 +181,8 @@ def _run_eval(args: argparse.Namespace, model: ModelSpec, level: int) -> Path:
         "-u",
         str(REPO_ROOT / "training" / "isaac_lab" / "manual_reward_probe.py"),
         "--headless",
+        "--repro-mode",
+        args.repro_mode,
         "--scenario",
         "hard_room_eval",
         "--controller-mode",
@@ -161,27 +198,52 @@ def _run_eval(args: argparse.Namespace, model: ModelSpec, level: int) -> Path:
         "--eval-obstacle-level",
         str(level),
         "--actuator-mode",
-        "robotlab_dc",
+        args.actuator_mode,
         "--low-level-controller",
-        "robotlab",
-        "--robotlab-low-level-policy",
-        str(low_level_policy),
-        "--robotlab-command-clip",
-        str(model.command_clip),
+        args.low_level_controller,
         "--robot-asset-source",
-        "native_go2",
+        args.robot_asset_source,
+        "--episode-length-s",
+        str(args.episode_length_s),
         "--max-steps",
         str(args.max_steps),
         "--policy-stop-radius",
-        "0.45",
+        str(args.policy_stop_radius),
         "--policy-stop-mode",
-        "zero",
+        args.policy_stop_mode,
+        "--cbf-fov-deg",
+        str(args.cbf_fov_deg),
         "--sim-device",
         args.sim_device,
         "--log-root",
         str(log_root),
     ]
-    print(f"[eval] model={model.label} level={level} checkpoint={checkpoint}", flush=True)
+    if args.stay_steps >= 0:
+        command.extend(["--stay-steps", str(args.stay_steps)])
+    if args.disable_contact_termination:
+        command.append("--disable-contact-termination")
+    if args.low_level_controller == "robotlab":
+        command.extend(
+            [
+                "--robotlab-low-level-policy",
+                str(low_level_policy),
+                "--robotlab-command-clip",
+                str(model.command_clip),
+            ]
+        )
+    print(
+        "[eval] "
+        f"model={model.label} "
+        f"level={level} "
+        f"checkpoint={checkpoint} "
+        f"repro_mode={args.repro_mode} "
+        f"eval_protocol={args.eval_protocol} "
+        f"actuator_mode={args.actuator_mode} "
+        f"low_level_controller={args.low_level_controller} "
+        f"robot_asset_source={args.robot_asset_source} "
+        f"cbf_fov_deg={args.cbf_fov_deg}",
+        flush=True,
+    )
     subprocess.run(command, cwd=REPO_ROOT, env=env, check=True)
     return _latest_new_run_dir(log_root, before)
 
@@ -246,14 +308,36 @@ def main() -> None:
     parser.add_argument("--num-envs", type=int, default=16)
     parser.add_argument("--seed", type=int, default=20260601)
     parser.add_argument("--max-steps", type=int, default=900)
+    parser.add_argument("--episode-length-s", type=float, default=60.0)
+    parser.add_argument("--stay-steps", type=int, default=-1)
+    parser.add_argument("--disable-contact-termination", action="store_true", default=False)
     parser.add_argument("--sim-device", default="cuda:0")
+    parser.add_argument(
+        "--eval-protocol",
+        choices=("custom", "strict_env", "official_play_style", "assist_stop"),
+        default="custom",
+    )
+    parser.add_argument("--repro-mode", choices=("none", "gym_equiv"), default="none")
+    parser.add_argument("--actuator-mode", choices=("implicit", "ideal_pd", "gym_torque", "robotlab_dc"), default="robotlab_dc")
+    parser.add_argument("--low-level-controller", choices=("sea_nav_jit", "robotlab"), default="robotlab")
+    parser.add_argument("--robot-asset-source", choices=("converted_urdf", "native_go2"), default="native_go2")
+    parser.add_argument("--policy-stop-radius", type=float, default=0.45)
+    parser.add_argument("--policy-stop-mode", choices=("zero", "linear"), default="zero")
+    parser.add_argument("--cbf-fov-deg", type=float, default=240.0)
     args = parser.parse_args()
+    if args.repro_mode == "gym_equiv":
+        args.robot_asset_source = "converted_urdf"
+        args.actuator_mode = "gym_torque"
+        args.low_level_controller = "sea_nav_jit"
+        args.policy_stop_radius = -1.0
+        args.cbf_fov_deg = 180.0
+    _apply_eval_protocol(args)
 
     rows: list[dict] = []
     for model in args.model:
         for level in args.levels:
             run_dir = _run_eval(args, model, level)
-            rows.append(_summarize_run(model, level, run_dir))
+            rows.append(_summarize_run(args, model, level, run_dir))
 
     output_dir = REPO_ROOT / "logs" / "isaac_lab" / args.comparison_name
     _write_outputs(output_dir, rows)
