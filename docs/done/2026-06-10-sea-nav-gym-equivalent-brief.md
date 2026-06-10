@@ -230,6 +230,51 @@ Interpretation:
 - Moving/no-progress and timeout cases can have large commands and low progress, so they remain candidates for observation/path-choice mismatch or dynamics/contact residual.
 - These traces are now ready to compare against a Gym-side fixed-case dump using the same room/start/goal/yaw.
 
+## Gym fixed-case parity harness
+
+Added a Gym-side trace script:
+
+- script: `training/legged_gym/legged_gym/scripts/gym_fixed_case_trace.py`
+- env support: `LeggedRobotPos.set_manual_start_and_goal(...)`
+- terrain support: `Terrain.preset_room_terrain(...)` via `env_cfg.terrain.preset_room_npy`
+- output: `summary.json`, `trace.jsonl`, and copied `room.npy`
+
+The Gym trace uses the same Lab source trace and fixed cases:
+
+- source trace: `logs/isaac_lab/G0_fresh2500_official_playstyle_100eps_20260610/G0_model2500_playstyle/level_9/manual_reward_probe_hard_room_eval/06_10_20-16-39/trace.jsonl`
+- source room: sibling `room.npy`
+- cases: `3,6,8,14,20,18,52,0,1,2`
+
+Default command for the 3050 Gym machine:
+
+```bash
+python training/legged_gym/legged_gym/scripts/gym_fixed_case_trace.py \
+  --headless \
+  --sim_device cuda:0 \
+  --rl_device cuda:0 \
+  --case-trace logs/isaac_lab/G0_fresh2500_official_playstyle_100eps_20260610/G0_model2500_playstyle/level_9/manual_reward_probe_hard_room_eval/06_10_20-16-39/trace.jsonl \
+  --case-episodes 3,6,8,14,20,18,52,0,1,2 \
+  --policy-checkpoint logs/isaac_lab/G0_gym_equiv_training/06_10_17-58-56_1024env_2500it_torque_fix_20260610/model_2500.pt \
+  --cbf-fov-deg 180 \
+  --episode-length-s 40 \
+  --max-steps 2000 \
+  --stay-steps 500 \
+  --goal-reached-steps 150 \
+  --log-root logs/legged_gym/G0_fixed_case_parity_20260610
+```
+
+Important coordinate note:
+
+- Isaac Lab fixed-case trace stores room-local coordinates centered at `(0, 0)`, so `cell -> cell * 0.1 - 5.0`.
+- Isaac Gym terrain row/col indexing uses world coordinates from the room corner, so `cell -> cell * 0.1` for the actual spawn/goal injection.
+- The Gym trace still writes `x/y` as centered room coordinates to make field-level comparison against Lab trace easier, and separately writes `start_xy_world` / `goal_xy_world`.
+
+Local verification status:
+
+- `py_compile` passed for the new Gym script and touched Gym env files.
+- `git diff --check` passed.
+- The current workstation does not have `isaacgym` importable, so runtime execution must happen on the Gym-capable machine.
+
 ## Prompt for GPTPro
 
 Please analyze this Isaac Lab SEA-Nav reproduction state.

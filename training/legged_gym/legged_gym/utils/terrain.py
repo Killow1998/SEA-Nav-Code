@@ -31,6 +31,7 @@
 import numpy as np
 from numpy.random import choice
 import random
+import os
 from isaacgym import terrain_utils
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
 from .custom_terrain import *
@@ -60,7 +61,10 @@ class Terrain:
 
         self.height_field_raw = np.zeros((self.tot_rows , self.tot_cols), dtype=np.int16)
         
-        if cfg.curriculum:
+        preset_room_npy = getattr(cfg, "preset_room_npy", "")
+        if preset_room_npy:
+            self.preset_room_terrain(preset_room_npy)
+        elif cfg.curriculum:
             self.curriculum_terrain()
         else:    
             self.randomized_terrain()   
@@ -201,6 +205,33 @@ class Terrain:
         y2 = int((self.env_width/2. + 0.5) / terrain.horizontal_scale)
         env_origin_z = np.max(terrain.height_field_raw[x1:x2, y1:y2])*terrain.vertical_scale
         self.env_origins[i, j] = [env_origin_x, env_origin_y, env_origin_z]
+
+    def preset_room_terrain(self, preset_room_npy):
+        room_path = os.path.expanduser(preset_room_npy)
+        room = np.load(room_path).astype(np.float32)
+        expected_shape = (self.length_per_env_pixels, self.width_per_env_pixels)
+        if room.shape != expected_shape:
+            raise ValueError(f"preset room shape {room.shape} != expected {expected_shape}: {room_path}")
+
+        if np.nanmax(np.abs(room)) > 20.0:
+            room_raw = np.rint(room).astype(np.int16)
+        else:
+            room_raw = np.rint(room / self.cfg.vertical_scale).astype(np.int16)
+
+        for row in range(self.cfg.num_rows):
+            for col in range(self.cfg.num_cols):
+                start_x = self.border + row * self.length_per_env_pixels
+                end_x = self.border + (row + 1) * self.length_per_env_pixels
+                start_y = self.border + col * self.width_per_env_pixels
+                end_y = self.border + (col + 1) * self.width_per_env_pixels
+                self.height_field_raw[start_x:end_x, start_y:end_y] = room_raw
+                self.env_origins[row, col] = [
+                    (row + 0.5) * self.env_length,
+                    (col + 0.5) * self.env_width,
+                    0.0,
+                ]
+        self.preset_room = room
+        print(f"\n loaded preset room terrain: {room_path}")
 
     def select_room(self, row, col):
         i = int(row)
@@ -346,5 +377,4 @@ class Terrain:
 
     def hard_room_terrain_func(self, terrain, difficulty):
         hard_room = create_rand_room(9, grid_size=20, target_size=self.length_per_env_pixels, min_distance=2, set_pos=False) # 100*100, obstacle height 0.2m ~ 1.0m
-        terrain.height_field_raw = hard_room * int(1. / terrain.vertical_scale) # terrain.vertical_scale = 0.005, so height_field_raw = hard_room * 200 
-    
+        terrain.height_field_raw = hard_room * int(1. / terrain.vertical_scale) # terrain.vertical_scale = 0.005, so height_field_raw = hard_room * 200

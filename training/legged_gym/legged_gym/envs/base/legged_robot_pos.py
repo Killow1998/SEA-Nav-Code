@@ -102,7 +102,9 @@ class LeggedRobotPos(LeggedRobot):
         self.delay_rays = torch.ones(self.num_envs, self.ray_angles.shape[0], dtype=torch.float, device=self.device, requires_grad=False) * 5.0
         self.nav_clip_min = torch.tensor([self.cfg.commands.ranges.limit_vx[0], self.cfg.commands.ranges.limit_vy[0], self.cfg.commands.ranges.limit_vyaw[0]], dtype=torch.float, device=self.device, requires_grad=False)
         self.nav_clip_max = torch.tensor([self.cfg.commands.ranges.limit_vx[1], self.cfg.commands.ranges.limit_vy[1], self.cfg.commands.ranges.limit_vyaw[1]], dtype=torch.float, device=self.device, requires_grad=False)
+        self.nav_actions_orig = torch.zeros(self.num_envs, self.cfg.env.num_nav_actions, device=self.device, requires_grad=False)
         self.nav_actions_filtered = torch.zeros(self.num_envs, 3, device=self.device, requires_grad=False)
+        self.slr_commands = torch.zeros(self.num_envs, 3, device=self.device, requires_grad=False)
         
         self.rays_hist = torch.ones(
                 self.num_envs, self.cfg.env.his_len, self.ray_angles.shape[0], device=self.device, dtype=torch.float) * 5.0
@@ -110,6 +112,17 @@ class LeggedRobotPos(LeggedRobot):
         self.stay_timer = torch.zeros(self.num_envs, device=self.device, dtype=torch.int) 
         self.goal_reached_flag = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)  
         self.stand_still_flag = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.last_reward_terms = {}
+        self.last_static = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.last_v_low = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.last_d_low = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.last_done_flags = {
+            "contact": torch.zeros(self.num_envs, device=self.device, dtype=torch.bool),
+            "goal_hold": torch.zeros(self.num_envs, device=self.device, dtype=torch.bool),
+            "stand": torch.zeros(self.num_envs, device=self.device, dtype=torch.bool),
+            "fall": torch.zeros(self.num_envs, device=self.device, dtype=torch.bool),
+            "timeout": torch.zeros(self.num_envs, device=self.device, dtype=torch.bool),
+        }
 
     def _init_replay_buffers(self):
         """ Initialize buffers for state replay and collision tracking. """
@@ -399,7 +412,12 @@ class LeggedRobotPos(LeggedRobot):
         self.goal_hold_timer[env_ids] = 0
         self.stay_timer[env_ids] = 0
         self.reach_goal[env_ids] = 0
+        self.nav_actions_orig[env_ids] = 0.
         self.nav_actions_filtered[env_ids] = 0.
+        self.slr_commands[env_ids] = 0.
+        self.last_static[env_ids] = False
+        self.last_v_low[env_ids] = False
+        self.last_d_low[env_ids] = False
         
         self.contact_filt[env_ids] = False
         self.last_contacts[env_ids] = False
@@ -419,6 +437,92 @@ class LeggedRobotPos(LeggedRobot):
             self.extras["episode"]["goal_level"] = torch.mean(self.goal_levels.float())
         if self.cfg.env.send_timeouts:
             self.extras["time_outs"] = self.time_out_buf
+
+    def set_manual_start_and_goal(
+        self,
+        env_ids: torch.Tensor,
+        robot_xy_world: torch.Tensor,
+        goal_xy_world: torch.Tensor,
+        yaw: float = 0.0,
+        root_height: float = 0.42,
+    ):
+        if env_ids.ndim == 0:
+            env_ids = env_ids.unsqueeze(0)
+        if robot_xy_world.ndim == 1:
+            robot_xy_world = robot_xy_world.unsqueeze(0).repeat(len(env_ids), 1)
+        if goal_xy_world.ndim == 1:
+            goal_xy_world = goal_xy_world.unsqueeze(0).repeat(len(env_ids), 1)
+
+        self.last_actions[env_ids] = 0.
+        self.last_dof_vel[env_ids] = 0.
+        self.feet_air_time[env_ids] = 0.
+        self.episode_length_buf[env_ids] = 0
+        self.obs_history_buf[env_ids, :, :] = 0.
+        self.slr_obs_hist[env_ids, :, :] = 0.
+        self.rays_hist[env_ids, :, :] = 5.
+        self.pos_hist[env_ids, :, :] = 0.
+        self.goal_hist[env_ids, :, :] = 0.
+        self.delay_rays[env_ids] = 5.
+        self.delay_goal[env_ids] = 0.
+        self.reset_buf[env_ids] = 0
+        self.goal_reached_flag[env_ids] = False
+        self.stand_still_flag[env_ids] = False
+        self.goal_hold_timer[env_ids] = 0
+        self.stay_timer[env_ids] = 0
+        self.reach_goal[env_ids] = False
+        self.nav_actions_orig[env_ids] = 0.
+        self.nav_actions_filtered[env_ids] = 0.
+        self.slr_commands[env_ids] = 0.
+        self.contact_filt[env_ids] = False
+        self.last_contacts[env_ids] = False
+        self.collision_occurred[env_ids] = False
+        self.last_collision_active[env_ids] = False
+        self.num_collisions[env_ids] = 0
+        self.collision_pos_hist[env_ids] = 0
+        self.last_static[env_ids] = False
+        self.last_v_low[env_ids] = False
+        self.last_d_low[env_ids] = False
+        for value in self.last_done_flags.values():
+            value[env_ids] = False
+        for key in self.episode_sums.keys():
+            self.episode_sums[key][env_ids] = 0.
+
+        self.env_origins[env_ids, 0:2] = robot_xy_world.to(self.device)
+        self.env_origins[env_ids, 2] = 0.0
+        self.position_targets[env_ids, 0:2] = goal_xy_world.to(self.device)
+        self.position_targets[env_ids, 2] = 0.0
+
+        self.dof_pos[env_ids] = self.default_dof_pos
+        self.dof_vel[env_ids] = 0.
+        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        self.gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_state),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32),
+        )
+
+        root_state = self.base_init_state.unsqueeze(0).repeat(len(env_ids), 1)
+        root_state[:, 0:2] = robot_xy_world.to(self.device)
+        root_state[:, 2] = root_height
+        yaw_tensor = torch.full((len(env_ids),), float(yaw), device=self.device)
+        zero = torch.zeros_like(yaw_tensor)
+        root_state[:, 3:7] = quat_from_euler_xyz(zero, zero, yaw_tensor)
+        root_state[:, 7:13] = 0.
+        self.root_states[env_ids] = root_state
+        self.base_quat[env_ids] = root_state[:, 3:7]
+        self.base_lin_vel[env_ids] = 0.
+        self.base_ang_vel[env_ids] = 0.
+        self.projected_gravity[env_ids] = quat_rotate_inverse(self.base_quat[env_ids], self.gravity_vec[env_ids])
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.root_states),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32),
+        )
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.update_percetion()
+        self.compute_observations()
         
     def _update_terrain_curriculum(self, env_ids):
         if not self.init_done:
@@ -610,6 +714,9 @@ class LeggedRobotPos(LeggedRobot):
         
         self.not_just_reset = (self.episode_length_buf/self.max_episode_length) > 0.1
         self.static = (v_low | d_low) & self.not_just_reset
+        self.last_v_low = v_low.clone()
+        self.last_d_low = d_low.clone()
+        self.last_static = self.static.clone()
         
         self.goal_hold_timer = self.goal_hold_timer + (self.reach_goal).int()
         self.stay_timer = self.stay_timer + (self.static).int()
@@ -623,6 +730,13 @@ class LeggedRobotPos(LeggedRobot):
         self.reset_buf |= self.stand_still_flag
         self.reset_buf |= self.time_out_buf
         self.reset_buf |= self.fall_down
+        self.last_done_flags = {
+            "contact": self.terminate_buf.clone(),
+            "goal_hold": self.goal_reached_flag.clone(),
+            "stand": self.stand_still_flag.clone(),
+            "fall": self.fall_down.clone(),
+            "timeout": self.time_out_buf.clone(),
+        }
 
     def compute_reward(self):
         """ Compute rewards
@@ -630,11 +744,13 @@ class LeggedRobotPos(LeggedRobot):
             adds each terms to the episode sums and to the total reward
         """
         self.rew_buf[:] = 0.
+        self.last_reward_terms = {}
         for i in range(len(self.reward_functions)):
             name = self.reward_names[i]
             rew = self.reward_functions[i]() * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
+            self.last_reward_terms[name] = rew.detach().clone()
             if torch.isnan(rew).nonzero().any():
                 raise ValueError(f"NaN detected in reward term '{name}'")
         if self.cfg.rewards.only_positive_rewards:
@@ -644,6 +760,7 @@ class LeggedRobotPos(LeggedRobot):
             rew = self._reward_termination() * self.reward_scales["termination"]
             self.rew_buf += rew
             self.episode_sums["termination"] += rew
+            self.last_reward_terms["termination"] = rew.detach().clone()
 
     def _get_perception(self):
         """ Resample navigation commands when camera message is ready (simulate real delay).
