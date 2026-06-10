@@ -156,6 +156,80 @@ In the true G0/G1 assist-stop traces, hard first-reach equals goal-hold (`G0 63/
 5. CBF `240 deg` is mildly helpful on hard no-stop (`58 -> 64`) but does not close the gap and should remain an ablation, not the official-compatible setting.
 6. The next paper-equivalent work should focus on fixed-case Gym-vs-Lab parity for observation, done/stand timers, reward terms, and trajectory behavior before changing reward scales or PPO.
 
+## Next checks started
+
+Started after `e39f060`:
+
+- Stand-disabled hard-room stress test for G0, preserving `gym_equiv`, `CBF 180`, 40s horizon, contact termination disabled, and seed `20260610`, but setting `stay_steps=999999`.
+- Purpose: test whether stand termination truncates recoverable G0 hard trajectories or simply labels already-stuck trajectories.
+- Follow-up: use fixed failed/success cases for richer observation/action dumps once the stand-disabled result says whether stand termination is causal.
+
+## Stand-disabled result
+
+Run:
+
+- `logs/isaac_lab/G0_fresh2500_stand_disabled_level9_100eps_20260610`
+- G0 checkpoint: `model_2500.pt`
+- level: hard room obstacle level 9
+- protocol: custom 40s horizon, contact termination disabled, no stop wrapper, `stay_steps=999999`
+
+Result:
+
+| Run | hard goal_hold | hard first_reach | min<0.5 | Stand | Fall | Timeout | mean_min_distance |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| G0 no-stop | 58/100 | 63/100 | 63/100 | 33 | 1 | 8 | 1.343 |
+| G0 assist-stop | 63/100 | 63/100 | 63/100 | 28 | 1 | 8 | 1.577 |
+| G0 stand-disabled | 56/100 | 60/100 | 60/100 | 0 | 2 | 42 | 1.502 |
+
+Interpretation:
+
+- Disabling stand termination did not recover first-reach. It reduced success slightly and converted stand failures into timeouts.
+- This falsifies "Lab stand termination is the main cause of low G0 hard first-reach".
+- Stand is mostly a label for already-stuck/no-progress trajectories, not the primary truncation mechanism.
+
+## Lab fixed-case rich traces
+
+The Lab probe now supports:
+
+- `--trace-rich-fields`: per-step observation slices, rays, delayed rays/goals, CBF `u_bar/alpha/u_s`, reward terms, and static/stand booleans.
+- `--case-episodes`: run multiple fixed cases from a prior trace in one Isaac Lab process.
+
+Initial batch:
+
+- output: `logs/isaac_lab/G0_fixed_case_rich_batch_20260610/manual_reward_probe_hard_room_eval/06_10_22-10-00`
+- source trace: G0 hard no-stop level 9, `06_10_20-16-39/trace.jsonl`
+- original episodes: `3,6,8,14,20,18,52,0,1,2`
+
+| orig_ep | reason | first_reach | min_dist | done_step | stand_class | tail_policy | tail_lowlevel | tail_speed | tail_progress |
+|---:|---|---:|---:|---:|---|---:|---:|---:|---:|
+| 3 | stand | None | 1.863 | 816 | high_level_idle | 0.044 | 0.044 | 0.029 | -0.00001 |
+| 6 | stand | None | 3.069 | 1431 | high_level_idle | 0.029 | 0.027 | 0.032 | 0.00005 |
+| 8 | stand | None | 1.335 | 1329 | mixed_or_unknown | 0.053 | 0.049 | 0.059 | 0.00003 |
+| 14 | stand | None | 5.372 | 739 | moving_without_progress | 0.135 | 0.113 | 0.131 | 0.00046 |
+| 20 | timeout | None | 1.543 | 1998 | None | 0.518 | 0.503 | 0.296 | 0.00169 |
+| 18 | goal_hold | 435 | 0.224 | 1984 | None | 0.429 | 0.416 | 0.562 | -0.00292 |
+| 52 | timeout | None | 1.566 | 1998 | None | 0.602 | 0.584 | 0.655 | -0.00711 |
+| 0 | goal_hold | 328 | 0.110 | 927 | None | 0.200 | 0.197 | 0.305 | 0.00598 |
+| 1 | goal_hold | 416 | 0.269 | 960 | None | 0.138 | 0.131 | 0.188 | 0.00276 |
+| 2 | goal_hold | 507 | 0.062 | 1181 | None | 0.421 | 0.419 | 0.524 | 0.01060 |
+
+Tail rich-field signature:
+
+| orig_ep | reason | tail_dist | tail_goal_x | tail_goal_y | tail_front | tail_u_bar_abs | tail_u_s_abs | tail_cbf_delta | tail_alpha | tail_static_pct | tail_reach |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3 | stand | 1.901 | 1.856 | 0.408 | 0.416 | 0.039 | 0.044 | 0.007 | 1.182 | 0.99 | 0.00 |
+| 6 | stand | 3.654 | 1.769 | 3.198 | 0.337 | 0.023 | 0.029 | 0.023 | 1.059 | 0.99 | 0.00 |
+| 8 | stand | 2.962 | -0.528 | 2.915 | 0.351 | 0.081 | 0.057 | 0.048 | 1.275 | 0.99 | 0.00 |
+| 14 | stand | 5.391 | 3.302 | 4.261 | 0.383 | 0.152 | 0.134 | 0.022 | 1.135 | 0.99 | 0.00 |
+| 20 | timeout | 3.478 | 1.117 | -3.001 | 0.433 | 0.622 | 0.558 | 0.100 | 2.042 | 0.04 | 0.00 |
+| 52 | timeout | 3.185 | -1.772 | -2.548 | 0.501 | 0.634 | 0.579 | 0.066 | 1.608 | 0.00 | 0.00 |
+
+Interpretation:
+
+- High-level idle stand cases show very small `u_bar_abs` before CBF. CBF intervention is small, so these are not primarily "CBF suppressed the action" cases.
+- Moving/no-progress and timeout cases can have large commands and low progress, so they remain candidates for observation/path-choice mismatch or dynamics/contact residual.
+- These traces are now ready to compare against a Gym-side fixed-case dump using the same room/start/goal/yaw.
+
 ## Prompt for GPTPro
 
 Please analyze this Isaac Lab SEA-Nav reproduction state.

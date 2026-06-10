@@ -768,6 +768,9 @@ class SeaNavIsaacLabEnv(DirectRLEnv):
         self.last_done_stand = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.last_done_fall = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.last_done_timeout = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.last_static = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.last_v_low = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.last_d_low = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.last_root_pos_w = torch.zeros(n, 3, device=self.device)
         self.last_root_quat_w = torch.zeros(n, 4, device=self.device)
         self.last_reward_terms = {
@@ -1369,6 +1372,9 @@ class SeaNavIsaacLabEnv(DirectRLEnv):
         self.last_done_stand.copy_(self.stand_still_flag)
         self.last_done_fall.copy_(fall_down)
         self.last_done_timeout.copy_(time_out)
+        self.last_static.copy_(static)
+        self.last_v_low.copy_(v_low)
+        self.last_d_low.copy_(d_low)
         terminated = self._terminated | self.goal_reached_flag | self.stand_still_flag | fall_down
         return terminated, time_out
 
@@ -1412,6 +1418,9 @@ class SeaNavIsaacLabEnv(DirectRLEnv):
         self.stay_timer[env_ids] = 0
         self.goal_reached_flag[env_ids] = False
         self.stand_still_flag[env_ids] = False
+        self.last_static[env_ids] = False
+        self.last_v_low[env_ids] = False
+        self.last_d_low[env_ids] = False
         self.obs_history_buf[env_ids] = 0.0
         self.pos_hist[env_ids] = 0.0
         self.prop_buf[env_ids] = 0.0
@@ -1513,6 +1522,9 @@ class SeaNavIsaacLabEnv(DirectRLEnv):
         self.stay_timer[env_ids] = 0
         self.goal_reached_flag[env_ids] = False
         self.stand_still_flag[env_ids] = False
+        self.last_static[env_ids] = False
+        self.last_v_low[env_ids] = False
+        self.last_d_low[env_ids] = False
         self.obs_history_buf[env_ids] = 0.0
         self.pos_hist[env_ids] = 0.0
         self.prop_buf[env_ids] = 0.0

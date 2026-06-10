@@ -86,10 +86,12 @@ def build_arg_parser():
     parser.add_argument("--preset-room-npy", type=str, default="")
     parser.add_argument("--case-trace", type=str, default="")
     parser.add_argument("--case-episode", type=int, default=-1)
+    parser.add_argument("--case-episodes", type=str, default="")
     parser.add_argument("--fixed-start-cell", type=str, default="")
     parser.add_argument("--fixed-goal-cell", type=str, default="")
     parser.add_argument("--fixed-start-yaw", type=float, default=0.0)
     parser.add_argument("--trace-steps", action="store_true", default=False)
+    parser.add_argument("--trace-rich-fields", action="store_true", default=False)
     parser.add_argument("--policy-stop-radius", type=float, default=-1.0)
     parser.add_argument("--policy-stop-mode", choices=("zero", "linear"), default="zero")
     parser.add_argument("--nav-action-scale", type=float, nargs=3, metavar=("VX", "VY", "WZ"), default=(1.0, 1.0, 1.0))
@@ -177,10 +179,17 @@ def _run_with_sim_app(args):
     fixed_start_cell = _parse_cell_arg(args.fixed_start_cell)
     fixed_goal_cell = _parse_cell_arg(args.fixed_goal_cell)
     fixed_start_yaw = args.fixed_start_yaw
+    args._case_sequence = []
     if args.case_trace:
         if fixed_start_cell is not None or fixed_goal_cell is not None:
             raise ValueError("--case-trace cannot be combined with --fixed-start-cell/--fixed-goal-cell")
-        case = _load_case_from_trace(args.case_trace, args.case_episode)
+        case_episode_ids = _parse_episode_list(args.case_episodes)
+        if case_episode_ids:
+            args._case_sequence = _load_cases_from_trace(args.case_trace, case_episode_ids)
+            args.episodes = len(args._case_sequence)
+            case = args._case_sequence[0]
+        else:
+            case = _load_case_from_trace(args.case_trace, args.case_episode)
         fixed_start_cell = case["start_cell"]
         fixed_goal_cell = case["goal_cell"]
         fixed_start_yaw = float(case["start_yaw"])
@@ -455,6 +464,19 @@ def _parse_cell_arg(value: str) -> tuple[int, int] | None:
     return int(parts[0]), int(parts[1])
 
 
+def _parse_episode_list(value: str) -> list[int]:
+    value = value.strip()
+    if not value:
+        return []
+    episodes = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        episodes.append(int(part))
+    return episodes
+
+
 def _load_case_from_trace(trace_path: str, episode_idx: int) -> dict[str, object]:
     trace_file = Path(trace_path)
     if not trace_file.is_file():
@@ -481,6 +503,10 @@ def _load_case_from_trace(trace_path: str, episode_idx: int) -> dict[str, object
                 "room_npy": str(trace_file.with_name("room.npy")),
             }
     raise ValueError(f"episode {episode_idx} not found in case trace {trace_file}")
+
+
+def _load_cases_from_trace(trace_path: str, episode_ids: list[int]) -> list[dict[str, object]]:
+    return [_load_case_from_trace(trace_path, episode_idx) for episode_idx in episode_ids]
 
 
 def _make_empty_room(np):
@@ -907,6 +933,74 @@ def _tensor_scalar(value):
     if hasattr(value, "ndim"):
         return float(value.float().mean().item() if value.ndim > 0 else value.float().item())
     return float(value)
+
+
+def _tensor_list(value):
+    if value is None:
+        return None
+    return [float(x) for x in value.detach().cpu().reshape(-1).tolist()]
+
+
+def _bool_tensor_item(value, env_id: int = 0) -> bool:
+    return bool(value[env_id].item())
+
+
+def _policy_debug_fields(policy_fn):
+    module = getattr(policy_fn, "__self__", None)
+    if module is None:
+        return {}
+    u_bar = getattr(module, "u_bar", None)
+    u_s = getattr(module, "u_s", None)
+    alpha = getattr(module, "alpha", None)
+    fields = {}
+    if u_bar is not None:
+        fields["cbf_u_bar"] = _tensor_list(u_bar[0])
+    if u_s is not None:
+        fields["cbf_u_s"] = _tensor_list(u_s[0])
+    if u_bar is not None and u_s is not None:
+        fields["cbf_delta"] = _tensor_list((u_s - u_bar)[0])
+    if alpha is not None:
+        fields["cbf_alpha"] = float(alpha[0].detach().cpu().reshape(-1)[0].item())
+    return fields
+
+
+def _rich_pre_step_fields(env, policy_fn, policy_obs):
+    obs_last_step = policy_obs[0, -env.num_obs_one_step :]
+    props = obs_last_step[: env.cfg.num_props]
+    log2_delay_rays = obs_last_step[env.cfg.num_props : env.cfg.num_props + env.cfg.num_rays]
+    delay_goal = obs_last_step[-2:]
+    fields = {
+        "obs_last_step": _tensor_list(obs_last_step),
+        "obs_props": _tensor_list(props),
+        "obs_log2_delay_rays": _tensor_list(log2_delay_rays),
+        "obs_delay_goal": _tensor_list(delay_goal),
+        "obs_history_flat": _tensor_list(policy_obs[0]),
+        "rays": _tensor_list(env.rays[0]),
+        "delay_rays": _tensor_list(env.delay_rays[0]),
+        "rays_hist": _tensor_list(env.rays_hist[0]),
+        "goal_local_pos": _tensor_list(env.goal_local_pos[0]),
+        "delay_goal": _tensor_list(env.delay_goal[0]),
+        "goal_hist": _tensor_list(env.goal_hist[0]),
+        "projected_gravity_b": _tensor_list(env._robot.data.projected_gravity_b[0]),
+        "base_lin_vel_b": _tensor_list(env._robot.data.root_lin_vel_b[0]),
+        "base_ang_vel_b": _tensor_list(env._robot.data.root_ang_vel_b[0]),
+        "slr_commands": _tensor_list(env.slr_commands[0]),
+        "ray_angles": _tensor_list(env.ray_angles),
+    }
+    fields.update(_policy_debug_fields(policy_fn))
+    return fields
+
+
+def _rich_post_step_fields(env):
+    return {
+        "reward_terms": {key: float(value[0].item()) for key, value in env.last_reward_terms.items()},
+        "reach_goal": _bool_tensor_item(env.reach_goal),
+        "static": _bool_tensor_item(env.last_static),
+        "v_low": _bool_tensor_item(env.last_v_low),
+        "d_low": _bool_tensor_item(env.last_d_low),
+        "stand_still_flag": _bool_tensor_item(env.stand_still_flag),
+        "goal_reached_flag": _bool_tensor_item(env.goal_reached_flag),
+    }
 
 
 def _load_inference_policy(env, checkpoint_path: str, cbf_fov_deg: float):
@@ -1557,7 +1651,10 @@ def _run_hard_room_eval_vectorized(env, args, policy_fn):
         "fixed_start_cell": None,
         "fixed_goal_cell": None,
         "fixed_start_yaw": None,
+        "case_trace": None,
+        "case_episodes": [],
         "trace_steps": False,
+        "trace_rich_fields": False,
         "policy_stop_radius": args.policy_stop_radius if args.policy_stop_radius >= 0.0 else None,
         "policy_stop_mode": args.policy_stop_mode if args.policy_stop_radius >= 0.0 else None,
         "policy_turn_yaw_threshold": None,
@@ -1609,10 +1706,11 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
     stand_diagnostic_counts = {}
     fixed_start_cell = _parse_cell_arg(args.fixed_start_cell)
     fixed_goal_cell = _parse_cell_arg(args.fixed_goal_cell)
+    case_sequence = getattr(args, "_case_sequence", [])
     if (fixed_start_cell is None) != (fixed_goal_cell is None):
         raise ValueError("--fixed-start-cell and --fixed-goal-cell must be provided together")
-    if args.trace_steps and args.episodes != 1:
-        raise ValueError("--trace-steps currently requires --episodes 1")
+    if args.trace_steps and args.episodes != 1 and not case_sequence:
+        raise ValueError("--trace-steps currently requires --episodes 1 unless --case-episodes is used")
     if policy_fn is None and command_fn is None:
         raise ValueError("hard_room_eval requires either a policy function or a scripted command function")
     if policy_fn is None and fixed_start_cell is None:
@@ -1624,17 +1722,25 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
 
     for episode_idx in range(args.episodes):
         obs_dict, _ = env.reset()
-        if fixed_start_cell is not None:
+        current_fixed_start_cell = fixed_start_cell
+        current_fixed_goal_cell = fixed_goal_cell
+        current_fixed_start_yaw = args.fixed_start_yaw
+        if case_sequence:
+            case = case_sequence[episode_idx]
+            current_fixed_start_cell = case["start_cell"]
+            current_fixed_goal_cell = case["goal_cell"]
+            current_fixed_start_yaw = float(case["start_yaw"])
+        if current_fixed_start_cell is not None:
             env_ids = torch.tensor([0], dtype=torch.long, device=env.device)
-            start_xy = torch.tensor([_grid_to_local_xy(fixed_start_cell)], device=env.device)
-            goal_xy = torch.tensor([_grid_to_local_xy(fixed_goal_cell)], device=env.device)
-            env.set_manual_start_and_goal(env_ids, start_xy, goal_xy, yaw=args.fixed_start_yaw, root_height=0.42)
+            start_xy = torch.tensor([_grid_to_local_xy(current_fixed_start_cell)], device=env.device)
+            goal_xy = torch.tensor([_grid_to_local_xy(current_fixed_goal_cell)], device=env.device)
+            env.set_manual_start_and_goal(env_ids, start_xy, goal_xy, yaw=current_fixed_start_yaw, root_height=0.42)
             env.scene.write_data_to_sim()
             env.sim.forward()
             env.scene.update(dt=0.0)
             obs_dict = env._get_observations()
         if args.controller_mode == "path_follow" or args.policy_path_blend_weight >= 0.0:
-            _maybe_prepare_path_follow(env, args, fixed_start_cell, fixed_goal_cell)
+            _maybe_prepare_path_follow(env, args, current_fixed_start_cell, current_fixed_goal_cell)
         policy_obs = obs_dict["policy"]
         start_local_xy = (
             env._robot.data.root_pos_w[0, 0].item() - env._terrain.env_origins[0, 0].item(),
@@ -1700,9 +1806,10 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
         previous_distance_value = None
 
         for step_idx in range(args.max_steps):
+            obs_for_action = policy_obs
             if policy_fn is not None:
                 with torch.inference_mode():
-                    command = policy_fn(policy_obs)
+                    command = policy_fn(obs_for_action)
                 if args.policy_path_blend_weight >= 0.0 and env.distance[0].item() >= args.policy_path_blend_min_distance:
                     path_command = torch.tensor([_path_follow_command(step_idx, env)], dtype=torch.float, device=env.device)
                     weight = max(0.0, min(1.0, args.policy_path_blend_weight))
@@ -1717,6 +1824,11 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
                     scale = max(0.0, min(1.0, env.distance[0].item() / args.policy_stop_radius))
                     command = command * scale
             raw_command_vec = [float(x) for x in command[0].tolist()]
+            rich_pre_step = (
+                _rich_pre_step_fields(env, policy_fn, obs_for_action)
+                if args.trace_steps and args.trace_rich_fields and policy_fn is not None
+                else {}
+            )
             obs_dict, rewards, terminated, truncated, extras = env.step(command)
             if policy_fn is not None:
                 policy_obs = obs_dict["policy"]
@@ -1788,6 +1900,9 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
                         "truncated": bool(truncated[0].item()),
                     }
                 )
+                if args.trace_rich_fields:
+                    trace_rows[-1].update(rich_pre_step)
+                    trace_rows[-1].update(_rich_post_step_fields(env))
 
             if bool((terminated | truncated).item()):
                 done_step = step_idx
@@ -1894,7 +2009,10 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
         "fixed_start_cell": None if fixed_start_cell is None else list(fixed_start_cell),
         "fixed_goal_cell": None if fixed_goal_cell is None else list(fixed_goal_cell),
         "fixed_start_yaw": args.fixed_start_yaw if fixed_start_cell is not None else None,
+        "case_trace": args.case_trace if args.case_trace else None,
+        "case_episodes": [int(case["episode"]) for case in case_sequence],
         "trace_steps": args.trace_steps,
+        "trace_rich_fields": args.trace_rich_fields,
         "policy_stop_radius": args.policy_stop_radius if args.policy_stop_radius >= 0.0 else None,
         "policy_stop_mode": args.policy_stop_mode if args.policy_stop_radius >= 0.0 else None,
         "policy_turn_yaw_threshold": args.policy_turn_yaw_threshold if args.policy_turn_yaw_threshold >= 0.0 else None,
