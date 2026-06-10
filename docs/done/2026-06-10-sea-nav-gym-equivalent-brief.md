@@ -64,6 +64,7 @@ Fix:
 - `DifferentiableSafeActorCritic` now passes `cbf_fov_deg` into `ExactLSECBFLayer`.
 - `--repro-mode gym_equiv` defaults to `180 deg`, while explicit `--cbf-fov-deg 240` remains supported for G1.
 - `manual_reward_probe.py` no longer lets `--repro-mode gym_equiv` override an explicit assist-stop setting. The earlier `G0_fresh2500_assist_stop_100eps_20260610` run is invalid for assist-stop because this override was still present.
+- `eval_checkpoint_comparison.py` preserves an explicitly provided `--policy-stop-radius` under `--repro-mode gym_equiv --eval-protocol custom`; default gym-equivalent custom eval still runs with no stop wrapper.
 
 ## Fresh G0 training
 
