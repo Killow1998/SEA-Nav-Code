@@ -101,8 +101,31 @@ def _build_train_cfg(args) -> dict:
             "actor_hidden_dims": [512, 256, 128],
             "critic_hidden_dims": [512, 256, 128],
             "activation": "elu",
+            "cbf_fov_deg": args.cbf_fov_deg,
         },
     }
+
+
+def _apply_repro_mode(args) -> None:
+    if args.repro_mode == "none":
+        if args.cbf_fov_deg is None:
+            args.cbf_fov_deg = 240.0
+        return
+    if args.repro_mode != "gym_equiv":
+        raise ValueError(f"Unsupported repro mode: {args.repro_mode}")
+
+    args.robot_asset_source = "converted_urdf"
+    args.actuator_mode = "gym_torque"
+    args.low_level_controller = "sea_nav_jit"
+    args.learning_rate_min = 1.0e-5
+    args.learning_rate_max = 1.0e-2
+    args.goal_stop_radius = -1.0
+    if args.cbf_fov_deg is None:
+        args.cbf_fov_deg = 180.0
+    if args.action_reg_min is None:
+        args.action_reg_min = (-0.5, -1.0, -1.0)
+    if args.action_reg_max is None:
+        args.action_reg_max = (2.0, 1.0, 1.0)
 
 
 def _build_log_dir(args) -> Path:
@@ -280,6 +303,7 @@ class SeaNavVecEnvWrapper:
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="SEA-Nav Isaac Lab training entrypoint")
+    parser.add_argument("--repro-mode", choices=("none", "gym_equiv"), default="none")
     parser.add_argument("--num-envs", type=int, default=256)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -307,6 +331,7 @@ def _parse_args():
     parser.add_argument("--learning-rate-max", type=float, default=5.0e-4)
     parser.add_argument("--lr-schedule", choices=("adaptive", "fixed"), default="adaptive")
     parser.add_argument("--entropy-coef", type=float, default=0.003)
+    parser.add_argument("--cbf-fov-deg", type=float, default=None)
     parser.add_argument("--action-reg-min", type=float, nargs=3, metavar=("VX", "VY", "WZ"), default=None)
     parser.add_argument("--action-reg-max", type=float, nargs=3, metavar=("VX", "VY", "WZ"), default=None)
     parser.add_argument("--log-root", type=str, default=str(REPO_ROOT / "logs" / "isaac_lab"))
@@ -512,7 +537,14 @@ def _learn_with_metrics(runner, num_learning_iterations: int, init_at_random_ep_
 def main():
     global torch, SummaryWriter
     args = _parse_args()
-    print(f"[INFO] parsed args: num_envs={args.num_envs} smoke_steps={args.smoke_steps} max_iterations={args.max_iterations}")
+    _apply_repro_mode(args)
+    print(
+        "[INFO] parsed args: "
+        f"repro_mode={args.repro_mode} "
+        f"num_envs={args.num_envs} "
+        f"smoke_steps={args.smoke_steps} "
+        f"max_iterations={args.max_iterations}"
+    )
     if not args.wandb:
         _inject_wandb_stub()
 
@@ -614,6 +646,13 @@ def main():
             env_cfg.enable_collision_replay = False
         print(
             "[INFO] env switches "
+            f"repro_mode={args.repro_mode} "
+            f"robot_asset_source={args.robot_asset_source} "
+            f"actuator_mode={args.actuator_mode} "
+            f"low_level_controller={args.low_level_controller} "
+            f"cbf_fov_deg={args.cbf_fov_deg} "
+            f"learning_rate_min={args.learning_rate_min} "
+            f"learning_rate_max={args.learning_rate_max} "
             f"collision_replay={env_cfg.enable_collision_replay} "
             f"obs_noise={env_cfg.add_noise} "
             f"friction_rand={not args.disable_friction_rand} "

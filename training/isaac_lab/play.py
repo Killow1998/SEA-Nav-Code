@@ -59,6 +59,7 @@ def _resolve_export_dir(checkpoint_path: Path) -> Path:
 def _build_parser():
     parser = argparse.ArgumentParser(description="Isaac Lab playback script for SEA-Nav policies")
 
+    parser.add_argument("--repro-mode", choices=("none", "gym_equiv"), default="none")
     parser.add_argument("--checkpoint", type=str, default="")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--episodes", type=int, default=10)
@@ -90,6 +91,7 @@ def _build_parser():
     parser.add_argument("--policy-stop-radius", type=float, default=-1.0)
     parser.add_argument("--policy-stop-mode", choices=("zero", "linear"), default="zero")
     parser.add_argument("--nav-action-scale", type=float, nargs=3, metavar=("VX", "VY", "WZ"), default=(1.0, 1.0, 1.0))
+    parser.add_argument("--cbf-fov-deg", type=float, default=None)
     parser.add_argument("--record-video", action="store_true", default=False)
     parser.add_argument("--record-video-path", type=str, default="")
     parser.add_argument("--save-frames", action="store_true", default=False)

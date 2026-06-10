@@ -34,6 +34,7 @@ PROBE_TUNING = {
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="Manual reward probe for simple SEA-Nav scenes")
+    parser.add_argument("--repro-mode", choices=("none", "gym_equiv"), default="none")
     parser.add_argument(
         "--scenario",
         choices=("straight", "turn", "turn_wide", "turn_open", "hard_room_eval"),
@@ -92,6 +93,7 @@ def build_arg_parser():
     parser.add_argument("--policy-stop-radius", type=float, default=-1.0)
     parser.add_argument("--policy-stop-mode", choices=("zero", "linear"), default="zero")
     parser.add_argument("--nav-action-scale", type=float, nargs=3, metavar=("VX", "VY", "WZ"), default=(1.0, 1.0, 1.0))
+    parser.add_argument("--cbf-fov-deg", type=float, default=None)
     parser.add_argument("--policy-turn-yaw-threshold", type=float, default=-1.0)
     parser.add_argument("--policy-turn-forward-floor-pos", type=float, default=-1.0)
     parser.add_argument("--policy-turn-forward-floor-neg", type=float, default=-1.0)
@@ -124,6 +126,20 @@ def build_arg_parser():
 def _parse_args(argv=None):
     parser = build_arg_parser()
     return parser.parse_args(argv)
+
+
+def _apply_repro_mode(args):
+    if getattr(args, "repro_mode", "none") == "none":
+        if args.cbf_fov_deg is None:
+            args.cbf_fov_deg = 240.0
+        return
+    if args.repro_mode != "gym_equiv":
+        raise ValueError(f"Unsupported repro mode: {args.repro_mode}")
+    args.robot_asset_source = "converted_urdf"
+    args.actuator_mode = "gym_torque"
+    args.low_level_controller = "sea_nav_jit"
+    if args.cbf_fov_deg is None:
+        args.cbf_fov_deg = 180.0
 
 
 def _configure_probe_tuning(args):
@@ -244,7 +260,7 @@ def _run_with_sim_app(args):
         if args.controller_mode == "policy":
             if not args.checkpoint:
                 raise ValueError("--checkpoint is required when controller-mode=policy")
-            policy_fn = _load_inference_policy(env, args.checkpoint)
+            policy_fn = _load_inference_policy(env, args.checkpoint, args.cbf_fov_deg)
 
         if args.scenario == "hard_room_eval":
             if args.case_trace:
@@ -362,12 +378,14 @@ def _run_with_sim_app(args):
 
         summary = {
             "scenario": args.scenario,
+            "repro_mode": getattr(args, "repro_mode", "none"),
             "controller_mode": args.controller_mode,
             "actuator_mode": args.actuator_mode,
             "robot_asset_source": args.robot_asset_source,
             "low_level_controller": args.low_level_controller,
             "robotlab_low_level_policy": args.robotlab_low_level_policy,
             "robotlab_command_clip": args.robotlab_command_clip,
+            "cbf_fov_deg": args.cbf_fov_deg,
             "checkpoint": args.checkpoint if args.checkpoint else None,
             "stay_steps": args.stay_steps,
             "disable_contact_termination": args.disable_contact_termination,
@@ -891,7 +909,7 @@ def _tensor_scalar(value):
     return float(value)
 
 
-def _load_inference_policy(env, checkpoint_path: str):
+def _load_inference_policy(env, checkpoint_path: str, cbf_fov_deg: float):
     import torch
 
     rsl_rl_root = REPO_ROOT / "training" / "rsl_rl"
@@ -909,11 +927,12 @@ def _load_inference_policy(env, checkpoint_path: str):
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
+        cbf_fov_deg=cbf_fov_deg,
     ).to(env.device)
     loaded_dict = torch.load(checkpoint_path, map_location=env.device)
     actor_critic.load_state_dict(loaded_dict["model_state_dict"])
     actor_critic.eval()
-    print(f"[PLAY] loaded_policy={checkpoint_path}")
+    print(f"[PLAY] loaded_policy={checkpoint_path} cbf_fov_deg={cbf_fov_deg}")
     return actor_critic.act_inference
 
 
@@ -1517,12 +1536,14 @@ def _run_hard_room_eval_vectorized(env, args, policy_fn):
     )
     summary = {
         "scenario": args.scenario,
+        "repro_mode": getattr(args, "repro_mode", "none"),
         "controller_mode": args.controller_mode,
         "actuator_mode": args.actuator_mode,
         "robot_asset_source": args.robot_asset_source,
         "low_level_controller": args.low_level_controller,
         "robotlab_low_level_policy": args.robotlab_low_level_policy,
         "robotlab_command_clip": args.robotlab_command_clip,
+        "cbf_fov_deg": args.cbf_fov_deg,
         "checkpoint": args.checkpoint if args.checkpoint else None,
         "episodes": args.episodes,
         "num_envs": env.num_envs,
@@ -1854,12 +1875,14 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
     )
     summary = {
         "scenario": args.scenario,
+        "repro_mode": getattr(args, "repro_mode", "none"),
         "controller_mode": args.controller_mode,
         "actuator_mode": args.actuator_mode,
         "robot_asset_source": args.robot_asset_source,
         "low_level_controller": args.low_level_controller,
         "robotlab_low_level_policy": args.robotlab_low_level_policy,
         "robotlab_command_clip": args.robotlab_command_clip,
+        "cbf_fov_deg": args.cbf_fov_deg,
         "checkpoint": args.checkpoint if args.checkpoint else None,
         "episodes": args.episodes,
         "eval_obstacle_level": args.eval_obstacle_level,
@@ -1901,6 +1924,7 @@ def _run_hard_room_eval(env, args, policy_fn, command_fn=None):
 
 def run_probe(args):
     _ensure_isaaclab_imports()
+    _apply_repro_mode(args)
     _configure_probe_tuning(args)
     _preload_probe_runtime_dependencies()
     if (getattr(args, "record_topdown_video", "") or getattr(args, "record_frame_dir", "")) and getattr(

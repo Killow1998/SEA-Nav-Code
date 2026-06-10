@@ -17,6 +17,7 @@ class DifferentiableSafeActorCritic(nn.Module):
                     num_props=12,
                     num_rays=41,
                     his_len=10,
+                    cbf_fov_deg=240.0,
                  **kwargs):
         super().__init__()
 
@@ -88,7 +89,7 @@ class DifferentiableSafeActorCritic(nn.Module):
         )
 
         # 4. Closed-form CBF Layer
-        self.cbf_layer = ExactLSECBFLayer(num_rays=num_rays)
+        self.cbf_layer = ExactLSECBFLayer(num_rays=num_rays, fov_deg=cbf_fov_deg)
 
         self.std = nn.Parameter(1.5 * torch.ones(num_actions))
 

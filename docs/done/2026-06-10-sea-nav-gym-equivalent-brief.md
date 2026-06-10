@@ -49,6 +49,22 @@ Interpretation:
 
 The important correction is that our earlier strict result used `max_steps=900`, only 18 seconds at 50 Hz, which was too short and produced misleading max-step failures.
 
+## Repro harness fix
+
+The first pushed matrix commit was incomplete as a reproducible harness:
+
+- `eval_checkpoint_comparison.py` passed `--repro-mode` and `--cbf-fov-deg` into `manual_reward_probe.py`.
+- The pushed `manual_reward_probe.py` did not yet register those arguments.
+- `DifferentiableSafeActorCritic` instantiated `ExactLSECBFLayer(num_rays=num_rays)` without an explicit FOV, so a loaded checkpoint could not reliably reproduce `180 deg` versus `240 deg` CBF geometry.
+
+Fix:
+
+- `manual_reward_probe.py` now accepts `--repro-mode` and `--cbf-fov-deg`.
+- `train.py`, `play.py`, and `eval_checkpoint_comparison.py` expose the same CBF FOV knob.
+- `DifferentiableSafeActorCritic` now passes `cbf_fov_deg` into `ExactLSECBFLayer`.
+- `--repro-mode gym_equiv` defaults to `180 deg`, while explicit `--cbf-fov-deg 240` remains supported for G1.
+- `manual_reward_probe.py` no longer lets `--repro-mode gym_equiv` override an explicit assist-stop setting. The earlier `G0_fresh2500_assist_stop_100eps_20260610` run is invalid for assist-stop because this override was still present.
+
 ## Fresh G0 training
 
 Fresh paper-equivalent G0 run:
@@ -89,13 +105,55 @@ R0 adapted sanity check:
 - Same R0 checkpoint, but with `assist_stop`.
 - Result: `97/100`, `88/100`, `87/100`, total `272/300`.
 
+## First-reach re-score
+
+The traces record `first_reach_step` and `min_distance`, so the same episodes can be re-scored without changing the environment. This separates "reached but failed goal-hold" from "never reached the target radius".
+
+| Run | Level | goal_hold | first_reach | min<0.5 | reached_then_failed | Stand | Fall | Timeout |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| G0 no-stop | 3 | 96/100 | 98/100 | 98/100 | 2/100 | 2 | 0 | 2 |
+| G0 no-stop | 6 | 69/100 | 76/100 | 76/100 | 7/100 | 25 | 1 | 5 |
+| G0 no-stop | 9 | 58/100 | 63/100 | 63/100 | 5/100 | 33 | 1 | 8 |
+| G0 no-stop | all | 223/300 | 237/300 | 237/300 | 14/300 | 60 | 2 | 15 |
+| G1 no-stop | 9 | 64/100 | 66/100 | 66/100 | 2/100 | 29 | 1 | 6 |
+| R0 no-stop | 9 | 67/100 | 85/100 | 85/100 | 18/100 | 9 | 13 | 11 |
+| R0 assist-stop | 9 | 87/100 | 87/100 | 87/100 | 0/100 | 7 | 3 | 3 |
+
+Interpretation:
+
+- R0 no-stop has a large success-semantics gap: hard `first_reach=85/100` but `goal_hold=67/100`.
+- G0 no-stop does not. Hard `first_reach=63/100` and `goal_hold=58/100`; only `5/100` episodes reached then failed to hold.
+- Therefore stop/hold semantics strongly explains the adapted RobotLab R0 drop, but it cannot explain most of the paper-equivalent G0 hard-room gap.
+
+## Assist-stop check on G0/G1
+
+After fixing the repro-mode override in `manual_reward_probe.py`, the true assist-stop runs are:
+
+| Path | Eval protocol | CBF FOV | Level 3 | Level 6 | Level 9 | Total | Collision | Stand | Fall | Timeout |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| G0 | official_play_style | 180 | 96/100 | 69/100 | 58/100 | 223/300 | 0 | 60 | 2 | 15 |
+| G0 | assist_stop | 180 | 99/100 | 79/100 | 63/100 | 241/300 | 0 | 48 | 2 | 9 |
+| G1 | official_play_style | 240 | 96/100 | 68/100 | 64/100 | 228/300 | 0 | 58 | 1 | 13 |
+| G1 | assist_stop | 240 | 96/100 | 77/100 | 65/100 | 238/300 | 0 | 51 | 2 | 9 |
+| R0 | official_play_style | 240 | 80/100 | 79/100 | 67/100 | 226/300 | 0 | 27 | 18 | 29 |
+| R0 | assist_stop | 240 | 97/100 | 88/100 | 87/100 | 272/300 | 0 | 21 | 3 | 4 |
+
+G0/G1 assist-stop gives only modest improvement, especially on hard rooms:
+
+- G0 hard: `58 -> 63`
+- G1 hard: `64 -> 65`
+- R0 hard: `67 -> 87`
+
+In the true G0/G1 assist-stop traces, hard first-reach equals goal-hold (`G0 63/100`, `G1 65/100`). That means the remaining hard-room failures are mostly not "reached but counted as failure"; they mostly never enter the reach radius.
+
 ## Current interpretation
 
-1. G0 is viable after the torque-limit fix, but it is not yet an official-performance reproduction. Hard level is still `58/100` under official play-style no-stop eval.
-2. CBF FOV is not the primary explanation in this snapshot. Switching 180 to 240 improves total by only `+5/300`, mostly hard `58 -> 64`.
-3. Native Go2 plus RobotLab DC actuator changes failure mode, especially falls, but does not dominate aggregate success in this one-checkpoint ablation.
-4. R0's strong adapted result depends heavily on the explicit 0.45m stop wrapper. Without the stop wrapper, R0 is about the same aggregate as G0/G1/G2.
-5. The remaining paper-equivalent blocker appears to be high-level goal-hold / stand behavior in medium-hard rooms, not collision avoidance and not the official JIT low-level controller.
+1. The harness gap was real and is now fixed. Future G0/G1 evals can reproduce `repro_mode` and CBF FOV from committed code.
+2. The low-level SEA-Nav JIT controller is not the primary remaining suspect. The torque-limit bug was ours, and the corrected low-level path is stable enough for this matrix.
+3. Collision avoidance is not the blocker in this snapshot. All matrix rows have `collision=0`.
+4. Stop / success semantics is the main issue for R0 no-stop, but not for G0/G1. G0 hard no-stop reaches only `63/100`; true G0 assist-stop succeeds `63/100`.
+5. CBF `240 deg` is mildly helpful on hard no-stop (`58 -> 64`) but does not close the gap and should remain an ablation, not the official-compatible setting.
+6. The next paper-equivalent work should focus on fixed-case Gym-vs-Lab parity for observation, done/stand timers, reward terms, and trajectory behavior before changing reward scales or PPO.
 
 ## Prompt for GPTPro
 
@@ -103,15 +161,26 @@ Please analyze this Isaac Lab SEA-Nav reproduction state.
 
 The main question is:
 
-What is the most likely remaining mismatch preventing the paper-equivalent Isaac Lab G0 line from matching official SEA-Nav Gym performance, given that the low-level torque-limit bug is fixed and collision failures are zero?
+What is the most likely remaining mismatch preventing the paper-equivalent Isaac Lab G0 line from matching official SEA-Nav Gym performance, given that the low-level torque-limit bug is fixed, the committed eval harness now supports `--repro-mode` / `--cbf-fov-deg`, collision failures are zero, and true G0/G1 assist-stop does not materially improve hard-room success?
+
+Key evidence:
+
+- G0 no-stop: `96/100`, `69/100`, `58/100`, total `223/300`.
+- G0 assist-stop: `99/100`, `79/100`, `63/100`, total `241/300`.
+- G1 no-stop: `96/100`, `68/100`, `64/100`, total `228/300`.
+- G1 assist-stop: `96/100`, `77/100`, `65/100`, total `238/300`.
+- R0 no-stop: `80/100`, `79/100`, `67/100`, total `226/300`.
+- R0 assist-stop: `97/100`, `88/100`, `87/100`, total `272/300`.
+- G0 hard first-reach: no-stop `63/100`, assist-stop `63/100`.
+- R0 hard first-reach: no-stop `85/100`, assist-stop `87/100`.
 
 Please reason from the matrix above and prioritize the next discriminating checks. In particular:
 
-1. Should the next step be official Gym eval-semantics parity, observation/reward/done parity, or longer G0 training?
-2. In official SEA-Nav Gym, how exactly should success be counted: first reach, `goal_reached_time`, `stay_time`, or a play-wrapper behavior?
-3. Why would failures show mostly stand/high-level idle or moving-without-progress while collision remains zero?
-4. Could the 40s/500-step official play setting mean that our `goal_hold` implementation is still semantically wrong?
-5. Which code-level parity checks should be done before changing rewards or PPO?
+1. Should the next step be fixed-case Gym-vs-Lab observation/done/reward parity or longer G0 training?
+2. Why does G0 fail mostly as stand/high-level-idle or moving-without-progress while collision remains zero and first-reach is low?
+3. Which exact observation fields should be compared first: rays/log2 rays, goal-local position, projected gravity, base velocity, delayed obs history, or CBF output?
+4. Which done/reward fields are most likely to diverge: `static`, `stand_still_flag`, `goal_hold_timer`, `fall_down`, timeout order, or reach reward?
+5. What result would falsify "observation/done parity mismatch" and push us toward "training budget / PhysX residual" instead?
 
 Desired output:
 

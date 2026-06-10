@@ -323,14 +323,17 @@ def main() -> None:
     parser.add_argument("--robot-asset-source", choices=("converted_urdf", "native_go2"), default="native_go2")
     parser.add_argument("--policy-stop-radius", type=float, default=0.45)
     parser.add_argument("--policy-stop-mode", choices=("zero", "linear"), default="zero")
-    parser.add_argument("--cbf-fov-deg", type=float, default=240.0)
+    parser.add_argument("--cbf-fov-deg", type=float, default=None)
     args = parser.parse_args()
     if args.repro_mode == "gym_equiv":
         args.robot_asset_source = "converted_urdf"
         args.actuator_mode = "gym_torque"
         args.low_level_controller = "sea_nav_jit"
         args.policy_stop_radius = -1.0
-        args.cbf_fov_deg = 180.0
+        if args.cbf_fov_deg is None:
+            args.cbf_fov_deg = 180.0
+    elif args.cbf_fov_deg is None:
+        args.cbf_fov_deg = 240.0
     _apply_eval_protocol(args)
 
     rows: list[dict] = []
